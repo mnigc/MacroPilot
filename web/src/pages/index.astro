@@ -1,0 +1,153 @@
+---
+import Base from "../layouts/Base.astro";
+import { EquityChart, ScoreChart, SignalChart } from "../components/charts";
+import { regimeBands, REGIME_LABEL } from "../lib/bands";
+import {
+  getLatestRun,
+  getRegimePoints,
+  getTrades,
+  getPortfolio,
+  getLatestPrices,
+  getUpcomingEarnings,
+} from "../lib/db";
+
+const run = await getLatestRun();
+const regimePoints = run ? await getRegimePoints(run.id) : [];
+const latest = regimePoints.at(-1) ?? null;
+const bands = regimeBands(regimePoints.map((p) => p.date), regimePoints.map((p) => p.regime));
+
+const paperTrades = await getTrades("paper", 8);
+const portfolio = await getPortfolio("paper");
+const tickers = run?.tickers ?? [];
+const prices = await getLatestPrices(tickers);
+const earnings = await getUpcomingEarnings(tickers);
+
+const cashRow = portfolio.find((p) => p.ticker === "CASH");
+const cash = cashRow?.units ?? 0;
+const positions = portfolio.filter((p) => p.ticker !== "CASH");
+const equity = cash + positions.reduce((acc, p) => acc + p.units * (prices[p.ticker] ?? 0), 0);
+const startCash = (run?.params as { startCashUsdt?: number } | null)?.startCashUsdt ?? 10_000;
+const pnlPct = equity > 0 ? equity / startCash - 1 : 0;
+
+const dcaAmount = (run?.params as { dcaUsdt?: number } | null)?.dcaUsdt ?? 50;
+const nextFriday = (() => {
+  const now = new Date();
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const day = d.getUTCDay();
+  const add = (5 - day + 7) % 7 || 7;
+  d.setUTCDate(d.getUTCDate() + add);
+  return d.toISOString().slice(0, 10);
+})();
+
+// 最近 180 天用于迷你分数图与信号图
+const recent = regimePoints.slice(-180);
+const weights = positions
+  .map((p) => ({ ticker: p.ticker, weight: equity > 0 ? (p.units * (prices[p.ticker] ?? 0)) / equity : 0 }))
+  .sort((a, b) => b.weight - a.weight);
+const target = latest ? latest.equity_target / (tickers.length || 1) : 0;
+
+const fmtUsd = (v: number) => `$${v.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
+const fmtPct = (v: number) => `${(v * 100).toFixed(1)}%`;
+---
+<Base active="dash">
+  <div class="grid grid-4">
+    <div class="card metric">
+      <div class="label">Paper 组合净值</div>
+      <div class="value">{fmtUsd(equity)}</div>
+      <div class="sub {pnlPct >= 0 ? "up" : "down"}">{pnlPct >= 0 ? "▲" : "▼"} {fmtPct(Math.abs(pnlPct))} vs 初始 {fmtUsd(startCash)}</div>
+    </div>
+    <div class="card metric">
+      <div class="label">当前宏观体制</div>
+      <div class="value">
+        <span class="badge {latest?.regime ?? "neutral"}"><span class="dot"></span>{latest ? REGIME_LABEL[latest.regime] : "数据加载中"}</span>
+      </div>
+      <div class="sub">综合分 {latest ? latest.score.toFixed(3) : "—"}（触发线 0.60 / 0.30）</div>
+    </div>
+    <div class="card metric">
+      <div class="label">目标股票仓位</div>
+      <div class="value accent">{latest ? fmtPct(latest.equity_target) : "—"}</div>
+      <div class="sub">risk-off 时自动降至 25%</div>
+    </div>
+    <div class="card metric">
+      <div class="label">下次定投（周五）</div>
+      <div class="value">{nextFriday}</div>
+      <div class="sub">每周自动买入 {fmtUsd(dcaAmount)}，周末照常调仓</div>
+    </div>
+  </div>
+
+  <div class="section-title">信号分量（0 = 最不利，1 = 最有利）</div>
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>今日读数</h3>
+      {latest && (Object.entries(latest.signals) as [string, number][]).map(([key, v]) => (
+        <div class="signal-row">
+          <span class="name">{key === "liquidity" ? "流动性" : key === "volatility" ? "波动率" : key === "rates" ? "利率" : "趋势"}</span>
+          <div class="bar"><div class="fill" style={`width: ${v * 100}%; background: ${v >= 0.6 ? "var(--green)" : v <= 0.4 ? "var(--red)" : "var(--accent)"}`}></div></div>
+          <span class="num">{v.toFixed(2)}</span>
+        </div>
+      ))}
+      <div class="faint" style="margin-top:8px">权重：流动性 30% · 波动率 30% · 利率 20% · 趋势 20%（3 年滚动百分位）</div>
+    </div>
+    <div class="card">
+      <h3>综合分近 180 天（色带 = 体制）</h3>
+      <ScoreChart
+        client:load
+        points={recent.map((p) => ({ date: p.date, score: p.score }))}
+        bands={bands.filter((b) => b.end >= (recent[0]?.date ?? "9999"))}
+        scoreHigh={0.6}
+        scoreLow={0.3}
+        short
+      />
+    </div>
+  </div>
+
+  <div class="section-title">四引擎状态</div>
+  <div class="grid grid-4">
+    <div class="card"><h3>① 定投引擎</h3><div class="muted">每周五自动买入 {fmtUsd(dcaAmount)}，按目标权重分配到篮子</div></div>
+    <div class="card"><h3>② 体制引擎</h3><div class="muted">当前 <b class="accent">{latest ? REGIME_LABEL[latest.regime] : "—"}</b>，股票目标仓位 {latest ? fmtPct(latest.equity_target) : "—"}</div></div>
+    <div class="card"><h3>③ 漂移引擎</h3><div class="muted">个股权重偏离目标 ±5pp 即触发拉回，抑制磨损</div></div>
+    <div class="card"><h3>④ 财报引擎</h3>
+      {earnings.length
+        ? earnings.slice(0, 3).map((e) => <div class="muted">⚠ {e.ticker} 财报 {e.earnings_date}，临近自动减仓</div>)
+        : <div class="muted">未来 60 天篮子内无临近财报</div>}
+    </div>
+  </div>
+
+  <div class="section-title">当前持仓（paper）</div>
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>权重 vs 目标</h3>
+      {weights.map((w) => (
+        <div class="weight-row">
+          <span class="t">{w.ticker}</span>
+          <div class="bar"><div class="fill" style={`width: ${Math.min(100, w.weight * 400)}%`}></div></div>
+          <span class="v">{fmtPct(w.weight)}</span>
+        </div>
+      ))}
+      <div class="faint" style="margin-top:8px">现金 {fmtUsd(cash)} · 等权目标 {fmtPct(target)}/只</div>
+    </div>
+    <div class="card">
+      <h3>最近交易（paper）</h3>
+      <table>
+        <thead><tr><th>日期</th><th>标的</th><th>方向</th><th>金额</th><th>原因</th></tr></thead>
+        <tbody>
+          {paperTrades.map((t) => (
+            <tr>
+              <td>{t.date}</td>
+              <td>{t.ticker}</td>
+              <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "买入" : "卖出"}</td>
+              <td>{fmtUsd(t.notional_usdt)}</td>
+              <td class="text">{t.reason === "dca" ? "定投" : t.reason === "regime" ? "体制" : "漂移"}</td>
+            </tr>
+          ))}
+          {paperTrades.length === 0 && <tr><td colspan="5" class="text faint">暂无交易 —— 运行 npm run agent 开始</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section-title">策略净值（回测 run #{run?.id ?? "—"}）</div>
+  <div class="card">
+    {run && <EquityChart client:load strategy={run.equity.strategy} benchmark={run.equity.benchmark} bands={bands} />}
+  </div>
+</Base>

@@ -1,0 +1,105 @@
+---
+import Base from "../layouts/Base.astro";
+import { EquityChart, ScoreChart } from "../components/charts";
+import { regimeBands, REGIME_LABEL } from "../lib/bands";
+import { getLatestRun, getRegimePoints } from "../lib/db";
+
+const run = await getLatestRun();
+const regimePoints = run ? await getRegimePoints(run.id) : [];
+const bands = regimeBands(regimePoints.map((p) => p.date), regimePoints.map((p) => p.regime));
+const params = (run?.params ?? {}) as {
+  weights?: Record<string, number>;
+  scoreHigh?: number;
+  scoreLow?: number;
+  allocation?: Record<string, number>;
+  dcaUsdt?: number;
+  driftThresholdPp?: number;
+  costBps?: number;
+};
+
+const fmtPct = (v: number, digits = 1) => `${(v * 100).toFixed(digits)}%`;
+const metricsOf = (m: { totalReturn: number; cagr: number; maxDrawdown: number; sharpe: number }) => [
+  { label: "总收益", value: fmtPct(m.totalReturn), cls: m.totalReturn >= 0 ? "up" : "down" },
+  { label: "CAGR", value: fmtPct(m.cagr), cls: m.cagr >= 0 ? "up" : "down" },
+  { label: "最大回撤", value: fmtPct(m.maxDrawdown), cls: "down" },
+  { label: "夏普比率", value: m.sharpe.toFixed(2), cls: m.sharpe >= 1 ? "up" : "" },
+];
+
+const regimeDays = run?.regime_days ?? {};
+const totalDays = Object.values(regimeDays).reduce((a, b) => a + b, 0) || 1;
+const period = regimePoints.length ? `${regimePoints[0]?.date} → ${regimePoints.at(-1)?.date}` : "—";
+const weights = run?.final_weights ?? {};
+const weightRows = Object.entries(weights).sort((a, b) => b[1] - a[1]);
+---
+<Base active="backtest">
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>◆ 四引擎策略</h3>
+      <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
+        {run && metricsOf(run.metrics.strategy).map((m) => (
+          <div class="metric"><div class="label">{m.label}</div><div class={`value ${m.cls}`} style="font-size:20px">{m.value}</div></div>
+        ))}
+      </div>
+    </div>
+    <div class="card">
+      <h3>◇ 买入持有（同现金流基准）</h3>
+      <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
+        {run && metricsOf(run.metrics.benchmark).map((m) => (
+          <div class="metric"><div class="label">{m.label}</div><div class={`value ${m.cls}`} style="font-size:20px">{m.value}</div></div>
+        ))}
+      </div>
+    </div>
+  </div>
+  <div class="faint" style="margin-top:8px">
+    回测区间 {period} · 初始 $10,000 + 每周定投 ${params.dcaUsdt} · 单边成本 {params.costBps}bps · 财报引擎因历史财报日不可回溯而在回测中关闭（执行器中生效）
+  </div>
+
+  <div class="section-title">净值曲线（色带 = 宏观体制，可缩放）</div>
+  <div class="card">{run && <EquityChart client:load strategy={run.equity.strategy} benchmark={run.equity.benchmark} bands={bands} />}</div>
+
+  <div class="section-title">宏观综合分与体制切换</div>
+  <div class="card">
+    <ScoreChart
+      client:load
+      points={regimePoints.map((p) => ({ date: p.date, score: p.score }))}
+      bands={bands}
+      scoreHigh={params.scoreHigh ?? 0.6}
+      scoreLow={params.scoreLow ?? 0.3}
+    />
+  </div>
+
+  <div class="section-title">体制分布与参数</div>
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>体制时间占比（共 {totalDays.toLocaleString()} 个交易日）</h3>
+      {Object.entries(regimeDays).map(([regime, days]) => (
+        <div class="signal-row">
+          <span class="name">{REGIME_LABEL[regime] ?? regime}</span>
+          <div class="bar"><div class="fill" style={`width: ${(days / totalDays) * 100}%; background: ${regime === "riskOn" ? "var(--green)" : regime === "neutral" ? "var(--blue)" : "var(--red)"}`}></div></div>
+          <span class="num">{fmtPct(days / totalDays, 0)}</span>
+        </div>
+      ))}
+      <div class="faint" style="margin-top:8px">2022 年熊市（缩表 + 高波动）期间引擎自动降至防御仓位，是回撤减半的主要来源</div>
+    </div>
+    <div class="card">
+      <h3>策略参数（config/strategy.json）</h3>
+      <table>
+        <tbody>
+          <tr><td class="text muted">信号权重</td><td class="text">流动性 {params.weights?.liquidity} · 波动率 {params.weights?.volatility} · 利率 {params.weights?.rates} · 趋势 {params.weights?.trend}</td></tr>
+          <tr><td class="text muted">切换阈值</td><td>≥ {params.scoreHigh} risk-on · ≤ {params.scoreLow} risk-off（滞回）</td></tr>
+          <tr><td class="text muted">目标仓位</td><td class="text">risk-on {fmtPct(params.allocation?.riskOn ?? 0, 0)} / neutral {fmtPct(params.allocation?.neutral ?? 0, 0)} / risk-off {fmtPct(params.allocation?.riskOff ?? 0, 0)}</td></tr>
+          <tr><td class="text muted">漂移阈值</td><td>±{params.driftThresholdPp}pp</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section-title">期末权重</div>
+  <div class="card">
+    <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
+      {weightRows.map(([ticker, w]) => (
+        <div class="metric"><div class="label">{ticker}</div><div class="value" style="font-size:18px">{fmtPct(w)}</div></div>
+      ))}
+    </div>
+  </div>
+</Base>

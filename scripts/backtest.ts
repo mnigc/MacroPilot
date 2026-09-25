@@ -11,7 +11,7 @@ import { computeRegimeTimeline, type RegimeConfig } from "../src/strategy/regime
 import { runBacktest } from "../src/backtest/engine.js";
 import { computeMetrics } from "../src/backtest/metrics.js";
 import { parseFredCsv } from "../src/data/stats.js";
-import { getPool, initSchema, loadPricesFromDb, saveBacktestRun, upsertPrices } from "../src/db/index.js";
+import { getPool, initSchema, loadPricesFromDb, saveBacktestRun, saveRegimePoints, saveTrades, upsertPrices } from "../src/db/index.js";
 
 function loadStrategyConfig() {
   const raw = JSON.parse(readFileSync("config/strategy.json", "utf8")) as {
@@ -185,4 +185,10 @@ const runId = await saveBacktestRun({
   equity: { strategy: result.strategyEquity, benchmark: result.benchmarkEquity },
 });
 console.log(`回测结果已持久化至 postgres，run id=${runId}`);
+await saveRegimePoints(
+  runId,
+  timeline.map((p) => ({ date: p.date, score: p.score, regime: p.regime, equityTarget: p.equityTarget, signals: p.signals })),
+);
+await saveTrades(runId, result.trades);
+console.log(`体制时间线 ${timeline.length} 条、交易 ${result.trades.length} 笔已入库`);
 await db.end();

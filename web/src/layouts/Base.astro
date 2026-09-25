@@ -1,0 +1,31 @@
+---
+import "../styles/global.css";
+const { active = "", title = "MacroPilot · 代币化股票智能投顾" } = Astro.props;
+const items = [
+  { href: "/", label: "仪表盘", key: "dash" },
+  { href: "/backtest", label: "回测", key: "backtest" },
+  { href: "/trades", label: "交易记录", key: "trades" },
+];
+---
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+  </head>
+  <body>
+    <nav class="nav">
+      <div class="nav-inner">
+        <a href="/" class="logo">◈ MacroPilot<small>BNB Hack · 代币化股票专题</small></a>
+        {items.map((it) => <a href={it.href} class:list={["item", { active: active === it.key }]}>{it.label}</a>)}
+      </div>
+    </nav>
+    <div class="container">
+      <slot />
+      <div class="footer">
+        MacroPilot — 定投 · 体制 · 漂移 · 财报，四引擎共享一个链上执行器。纸面数据不构成投资建议。
+      </div>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,51 @@
+---
+import Base from "../layouts/Base.astro";
+import { getTrades } from "../lib/db";
+
+const paperTrades = await getTrades("paper", 200);
+const backtestTrades = await getTrades("backtest", 60);
+
+const reasonLabel = (r: string) => (r === "dca" ? "定投" : r === "regime" ? "体制" : "漂移");
+const fmt = (v: number) => `$${Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
+---
+<Base active="trades">
+  <div class="section-title">Paper 执行记录（{paperTrades.length} 笔 · 每次运行 npm run agent 产生）</div>
+  <div class="card">
+    <table>
+      <thead><tr><th>日期</th><th>标的</th><th>方向</th><th>数量（股）</th><th>金额</th><th>触发引擎</th></tr></thead>
+      <tbody>
+        {paperTrades.map((t) => (
+          <tr>
+            <td>{t.date}</td>
+            <td>{t.ticker}</td>
+            <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "买入" : "卖出"}</td>
+            <td>{Math.abs(t.units_delta).toFixed(4)}</td>
+            <td>{fmt(t.notional_usdt)}</td>
+            <td class="text">{reasonLabel(t.reason)}</td>
+          </tr>
+        ))}
+        {paperTrades.length === 0 && <tr><td colspan="6" class="text faint">暂无记录</td></tr>}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section-title">回测成交抽样（最近 60 笔 / 按日期倒序）</div>
+  <div class="card">
+    <table>
+      <thead><tr><th>日期</th><th>标的</th><th>方向</th><th>金额</th><th>触发引擎</th></tr></thead>
+      <tbody>
+        {backtestTrades.map((t) => (
+          <tr>
+            <td>{t.date}</td>
+            <td>{t.ticker}</td>
+            <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "买入" : "卖出"}</td>
+            <td>{fmt(t.notional_usdt)}</td>
+            <td class="text">{reasonLabel(t.reason)}</td>
+          </tr>
+        ))}
+        {backtestTrades.length === 0 && <tr><td colspan="5" class="text faint">暂无记录 —— 运行 npm run backtest</td></tr>}
+      </tbody>
+    </table>
+  </div>
+  <div class="faint" style="margin-top:8px">完整回测成交序列存于 Postgres trades 表（mode = backtest）；live 模式上线后 RFQ 真实成交将记于 mode = live。</div>
+</Base>

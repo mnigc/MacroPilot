@@ -26,11 +26,19 @@ export interface RegimeConfig {
   allocation: Record<Regime, number>;
 }
 
+export interface SignalScores {
+  liquidity: number;
+  volatility: number;
+  rates: number;
+  trend: number;
+}
+
 export interface RegimePoint {
   date: string;
   score: number;
   regime: Regime;
   equityTarget: number;
+  signals: SignalScores;
 }
 
 // 观察窗口（交易日）：
@@ -131,7 +139,13 @@ export function computeRegimeTimeline(bundle: MacroBundle, cfg: RegimeConfig): R
     if (score >= cfg.scoreHigh) regime = "riskOn";
     else if (score <= cfg.scoreLow) regime = "riskOff";
 
-    out.push({ date, score, regime, equityTarget: cfg.allocation[regime] });
+    out.push({
+      date,
+      score,
+      regime,
+      equityTarget: cfg.allocation[regime],
+      signals: { liquidity: liqScore, volatility: volScore, rates: rateScore, trend: trendScore },
+    });
   }
   return out;
 }

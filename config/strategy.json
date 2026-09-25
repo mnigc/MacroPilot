@@ -47,10 +47,11 @@
     "defiYieldParking": false
   },
   "execution": {
-    "$comment": "执行护栏：单笔最小 20 USDT 避免灰尘单；报价冲击超过 1% 中止；默认纸面模式",
+    "$comment": "执行护栏：单笔最小 20 USDT 避免灰尘单；报价冲击超过 1% 中止（live）；默认纸面模式。startCashUsdt 为 paper 组合首次运行的初始资金",
     "minTradeUsdt": 20,
     "maxPriceImpactPercent": 1.0,
     "slippagePercent": 0.5,
-    "mode": "paper"
+    "mode": "paper",
+    "startCashUsdt": 10000
   }
 }

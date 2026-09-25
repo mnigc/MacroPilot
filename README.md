@@ -64,11 +64,24 @@
 
 ```bash
 npm install
-cp .env.example .env      # 填入 BINANCE_API_KEY / BINANCE_SECRET_KEY（dev-portal 申请）
+cp .env.example .env      # 填入 BINANCE_API_KEY / BINANCE_SECRET_KEY + DATABASE_URL（dev-portal 申请）
 npm run smoke             # 连通性验证：拉取代币列表 + 实时价差
 npm test                  # 签名与编码单元测试
-npm run agent             # 手动触发一轮：信号计算 → 目标仓位 → (paper)执行
+npm run backtest          # 宏观信号 + 回测 → 结果持久化 Postgres
+npm run agent             # 执行器单次运行：四引擎 → paper 成交（周五自动定投）
+cd web && npm install && npm run build   # 可视化平台（构建时直读 Postgres）
 ```
+
+## 可视化平台（web/）
+
+Astro + React + ECharts，与 invest-platform 同栈。静态构建时直读 Supabase Postgres：
+
+- **仪表盘 `/`**：paper 组合净值、当前体制徽章与综合分、四信号分量、四引擎状态卡、持仓权重、最近交易
+- **回测 `/backtest`**：策略 vs 买入持有指标对比、净值曲线（体制色带 + 缩放）、宏观综合分与切换阈值、体制时间占比、参数表
+- **交易记录 `/trades`**：paper 执行记录 + 回测成交抽样（触发引擎逐笔标注）
+- **程序化接口**：`/api/backtest.json`、`/api/regime.json`（静态产出）
+
+数据管道：GitHub Actions 每交易日同步股价/财报日 → CSV 入库 → 回测与执行器读写 Postgres → 前端构建时渲染。
 
 ## 对齐评审标准
 
