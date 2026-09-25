@@ -17,14 +17,18 @@ const items = [
   <body>
     <nav class="nav">
       <div class="nav-inner">
-        <a href="/" class="logo">◈ MacroPilot<small>BNB Hack · 代币化股票专题</small></a>
+        <a href="/" class="logo">
+          <span class="mark">◆</span>
+          MacroPilot<small>BNB Hack · 代币化股票专题</small>
+        </a>
         {items.map((it) => <a href={it.href} class:list={["item", { active: active === it.key }]}>{it.label}</a>)}
       </div>
     </nav>
     <div class="container">
       <slot />
       <div class="footer">
-        MacroPilot — 定投 · 体制 · 漂移 · 财报，四引擎共享一个链上执行器。纸面数据不构成投资建议。
+        <span>MacroPilot — 定投 · 体制 · 漂移 · 财报，四引擎共享一个链上执行器</span>
+        <span>纸面数据，不构成投资建议 · <a href="https://github.com/mnigc/macro-bnbchain" style="color:var(--text-2)">GitHub</a></span>
       </div>
     </div>
   </body>

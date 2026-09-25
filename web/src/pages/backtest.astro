@@ -30,35 +30,41 @@ const totalDays = Object.values(regimeDays).reduce((a, b) => a + b, 0) || 1;
 const period = regimePoints.length ? `${regimePoints[0]?.date} → ${regimePoints.at(-1)?.date}` : "—";
 const weights = run?.final_weights ?? {};
 const weightRows = Object.entries(weights).sort((a, b) => b[1] - a[1]);
+const regimeColor = (r: string) => (r === "riskOn" ? "#2ebd85" : r === "neutral" ? "#5b8def" : "#f6465d");
 ---
 <Base active="backtest">
-  <div class="grid grid-2">
-    <div class="card">
-      <h3>◆ 四引擎策略</h3>
-      <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
+  <div class="hero reveal" style="padding-bottom:0">
+    <h1>回测<span class="grad">实验室</span></h1>
+    <p>同一套四引擎策略，跑真实历史 —— 与同现金流买入持有公平对照</p>
+  </div>
+
+  <div class="grid grid-2" style="margin-top: 22px;">
+    <div class="card accent-top reveal d1" style="border-color: rgba(240,185,11,0.22)">
+      <h3 style="color: var(--accent)">◆ 四引擎策略</h3>
+      <div class="grid" style="grid-template-columns: repeat(4, 1fr); margin-top: 6px;">
         {run && metricsOf(run.metrics.strategy).map((m) => (
-          <div class="metric"><div class="label">{m.label}</div><div class={`value ${m.cls}`} style="font-size:20px">{m.value}</div></div>
+          <div class="metric"><div class="label">{m.label}</div><div class={`value ${m.cls}`} style="font-size: 22px">{m.value}</div></div>
         ))}
       </div>
     </div>
-    <div class="card">
-      <h3>◇ 买入持有（同现金流基准）</h3>
-      <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
+    <div class="card reveal d2">
+      <h3 style="color: var(--text-2)">◇ 买入持有（同现金流基准）</h3>
+      <div class="grid" style="grid-template-columns: repeat(4, 1fr); margin-top: 6px;">
         {run && metricsOf(run.metrics.benchmark).map((m) => (
-          <div class="metric"><div class="label">{m.label}</div><div class={`value ${m.cls}`} style="font-size:20px">{m.value}</div></div>
+          <div class="metric"><div class="label">{m.label}</div><div class={`value ${m.cls}`} style="font-size: 22px; color: var(--text-2)">{m.value}</div></div>
         ))}
       </div>
     </div>
   </div>
-  <div class="faint" style="margin-top:8px">
+  <div class="faint reveal d2" style="margin-top: 10px">
     回测区间 {period} · 初始 $10,000 + 每周定投 ${params.dcaUsdt} · 单边成本 {params.costBps}bps · 财报引擎因历史财报日不可回溯而在回测中关闭（执行器中生效）
   </div>
 
-  <div class="section-title">净值曲线（色带 = 宏观体制，可缩放）</div>
-  <div class="card">{run && <EquityChart client:load strategy={run.equity.strategy} benchmark={run.equity.benchmark} bands={bands} />}</div>
+  <div class="section-title reveal d3">净值曲线 <span class="faint" style="font-weight:400">色带 = 宏观体制 · 可缩放</span></div>
+  <div class="card reveal d3">{run && <EquityChart client:load strategy={run.equity.strategy} benchmark={run.equity.benchmark} bands={bands} />}</div>
 
-  <div class="section-title">宏观综合分与体制切换</div>
-  <div class="card">
+  <div class="section-title reveal d4">宏观综合分与体制切换</div>
+  <div class="card reveal d4">
     <ScoreChart
       client:load
       points={regimePoints.map((p) => ({ date: p.date, score: p.score }))}
@@ -68,20 +74,20 @@ const weightRows = Object.entries(weights).sort((a, b) => b[1] - a[1]);
     />
   </div>
 
-  <div class="section-title">体制分布与参数</div>
+  <div class="section-title reveal d5">体制分布与策略参数</div>
   <div class="grid grid-2">
-    <div class="card">
+    <div class="card reveal d5">
       <h3>体制时间占比（共 {totalDays.toLocaleString()} 个交易日）</h3>
       {Object.entries(regimeDays).map(([regime, days]) => (
         <div class="signal-row">
-          <span class="name">{REGIME_LABEL[regime] ?? regime}</span>
-          <div class="bar"><div class="fill" style={`width: ${(days / totalDays) * 100}%; background: ${regime === "riskOn" ? "var(--green)" : regime === "neutral" ? "var(--blue)" : "var(--red)"}`}></div></div>
+          <span class="name" style="width:110px">{REGIME_LABEL[regime] ?? regime}</span>
+          <div class="bar"><div class="fill" style={`--w: ${(days / totalDays) * 100}%; background: linear-gradient(90deg, ${regimeColor(regime)}55, ${regimeColor(regime)}); box-shadow: 0 0 10px ${regimeColor(regime)}44;`}></div></div>
           <span class="num">{fmtPct(days / totalDays, 0)}</span>
         </div>
       ))}
-      <div class="faint" style="margin-top:8px">2022 年熊市（缩表 + 高波动）期间引擎自动降至防御仓位，是回撤减半的主要来源</div>
+      <div class="faint" style="margin-top:10px">2022 年熊市（缩表 + 高波动）引擎自动降至防御仓位 —— 回撤减半的主要来源</div>
     </div>
-    <div class="card">
+    <div class="card reveal d6">
       <h3>策略参数（config/strategy.json）</h3>
       <table>
         <tbody>
@@ -94,11 +100,11 @@ const weightRows = Object.entries(weights).sort((a, b) => b[1] - a[1]);
     </div>
   </div>
 
-  <div class="section-title">期末权重</div>
-  <div class="card">
+  <div class="section-title reveal d6">期末权重</div>
+  <div class="card reveal d6">
     <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
       {weightRows.map(([ticker, w]) => (
-        <div class="metric"><div class="label">{ticker}</div><div class="value" style="font-size:18px">{fmtPct(w)}</div></div>
+        <div class="metric"><div class="label">{ticker}</div><div class="value" style="font-size: 19px">{fmtPct(w)}</div></div>
       ))}
     </div>
   </div>

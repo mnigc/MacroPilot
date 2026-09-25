@@ -9,8 +9,13 @@ const reasonLabel = (r: string) => (r === "dca" ? "定投" : r === "regime" ? "�
 const fmt = (v: number) => `$${Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
 ---
 <Base active="trades">
-  <div class="section-title">Paper 执行记录（{paperTrades.length} 笔 · 每次运行 npm run agent 产生）</div>
-  <div class="card">
+  <div class="hero reveal" style="padding-bottom:0">
+    <h1>交易<span class="grad">流水</span></h1>
+    <p>每一笔成交都标注触发引擎 —— 定投 · 体制 · 漂移，未来 live 模式的 RFQ 真实成交同样入账</p>
+  </div>
+
+  <div class="section-title reveal d1" style="margin-top: 26px">Paper 执行记录 <span class="faint" style="font-weight:400">{paperTrades.length} 笔 · 每次运行 npm run agent 产生</span></div>
+  <div class="card reveal d1">
     <table>
       <thead><tr><th>日期</th><th>标的</th><th>方向</th><th>数量（股）</th><th>金额</th><th>触发引擎</th></tr></thead>
       <tbody>
@@ -18,10 +23,10 @@ const fmt = (v: number) => `$${Math.abs(v).toLocaleString("en-US", { maximumFrac
           <tr>
             <td>{t.date}</td>
             <td>{t.ticker}</td>
-            <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "买入" : "卖出"}</td>
+            <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
             <td>{Math.abs(t.units_delta).toFixed(4)}</td>
             <td>{fmt(t.notional_usdt)}</td>
-            <td class="text">{reasonLabel(t.reason)}</td>
+            <td class="text"><span class={`pill ${t.reason}`}>{reasonLabel(t.reason)}</span></td>
           </tr>
         ))}
         {paperTrades.length === 0 && <tr><td colspan="6" class="text faint">暂无记录</td></tr>}
@@ -29,8 +34,8 @@ const fmt = (v: number) => `$${Math.abs(v).toLocaleString("en-US", { maximumFrac
     </table>
   </div>
 
-  <div class="section-title">回测成交抽样（最近 60 笔 / 按日期倒序）</div>
-  <div class="card">
+  <div class="section-title reveal d2">回测成交抽样 <span class="faint" style="font-weight:400">最近 60 笔 · 按日期倒序</span></div>
+  <div class="card reveal d2">
     <table>
       <thead><tr><th>日期</th><th>标的</th><th>方向</th><th>金额</th><th>触发引擎</th></tr></thead>
       <tbody>
@@ -38,14 +43,14 @@ const fmt = (v: number) => `$${Math.abs(v).toLocaleString("en-US", { maximumFrac
           <tr>
             <td>{t.date}</td>
             <td>{t.ticker}</td>
-            <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "买入" : "卖出"}</td>
+            <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
             <td>{fmt(t.notional_usdt)}</td>
-            <td class="text">{reasonLabel(t.reason)}</td>
+            <td class="text"><span class={`pill ${t.reason}`}>{reasonLabel(t.reason)}</span></td>
           </tr>
         ))}
         {backtestTrades.length === 0 && <tr><td colspan="5" class="text faint">暂无记录 —— 运行 npm run backtest</td></tr>}
       </tbody>
     </table>
   </div>
-  <div class="faint" style="margin-top:8px">完整回测成交序列存于 Postgres trades 表（mode = backtest）；live 模式上线后 RFQ 真实成交将记于 mode = live。</div>
+  <div class="faint reveal d3" style="margin-top: 10px">完整回测成交序列存于 Postgres trades 表（mode = backtest）；live 模式上线后 RFQ 真实成交将记于 mode = live。</div>
 </Base>
