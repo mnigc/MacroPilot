@@ -1,5 +1,5 @@
 {
-  "$comment": "策略参数：宏观体制 -> 代币化股票篮子目标仓位。所有可调参数集中在此。",
+  "$comment": "策略参数：四个策略引擎（定投/体制/漂移/财报）共享一个执行器，输出合成一张目标权重表。所有可调参数集中在此。",
   "basket": {
     "$comment": "目标篮子：等权 Mag7。首次运行时通过 /rwa/search 解析为链上合约地址并缓存到 data/tokens.json",
     "tickers": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA"],
@@ -9,24 +9,48 @@
       "address": "0x55d398326f99059fF775485246999027B3197955"
     }
   },
-  "regime": {
-    "$comment": "体制状态机：综合分 >= high 进入 risk-on，<= low 进入 risk-off，中间保持现状（滞回带防止频繁翻转）",
-    "scoreHigh": 0.6,
-    "scoreLow": 0.3,
-    "allocation": { "riskOn": 1.0, "neutral": 0.6, "riskOff": 0.25 },
-    "signals": {
-      "liquidity": { "$comment": "美联储资产负债表 13 周变化", "fredSeries": "WALCL", "weight": 0.3 },
-      "rates": { "$comment": "10Y 国债收益率 13 周变化（下行加分）", "fredSeries": "DGS10", "weight": 0.2 },
-      "volatility": { "$comment": "VIX 水平与趋势", "fredSeries": "VIXCLS", "weight": 0.3 },
-      "trend": { "$comment": "标普 500 相对 200 日均线", "fredSeries": "SP500", "weight": 0.2 }
+  "engines": {
+    "dca": {
+      "$comment": "定投引擎：每周五 13:00 UTC（美股盘前）注入新资金，按当期目标权重买入",
+      "enabled": true,
+      "schedule": "weekly-friday-1300Z",
+      "amountUsdt": 50
+    },
+    "regime": {
+      "$comment": "体制引擎（风险内核）：四信号加权 → 综合分，>=high risk-on / <=low risk-off / 区间内保持（滞回防翻转）",
+      "scoreHigh": 0.6,
+      "scoreLow": 0.3,
+      "allocation": { "riskOn": 1.0, "neutral": 0.6, "riskOff": 0.25 },
+      "signals": {
+        "liquidity": { "$comment": "美联储资产负债表 13 周变化", "fredSeries": "WALCL", "weight": 0.3 },
+        "volatility": { "$comment": "VIX 水平与趋势", "fredSeries": "VIXCLS", "weight": 0.3 },
+        "rates": { "$comment": "10Y 国债收益率 13 周变化（下行加分）", "fredSeries": "DGS10", "weight": 0.2 },
+        "trend": { "$comment": "标普 500 相对 200 日均线", "fredSeries": "SP500", "weight": 0.2 }
+      }
+    },
+    "drift": {
+      "$comment": "漂移引擎：个股权重偏离目标超过阈值才拉回，避免高频小单磨损手续费",
+      "thresholdPp": 5
+    },
+    "earnings": {
+      "$comment": "财报引擎：财报日前 N 天将该股权重乘以 scale，财报后 restoreDays 天恢复。财报日数据源：优先 RWA underlying-profile，否则 yfinance 走 GitHub Actions 同步",
+      "enabled": true,
+      "riskOffDaysBefore": 2,
+      "scaleFactor": 0.5,
+      "restoreDaysAfter": 1,
+      "dataSource": "auto"
     }
   },
+  "sleeves": {
+    "$comment": "资金两筒：股票筒比例由体制引擎决定，其余留稳定币筒。DeFi 收益筒为 stretch goal",
+    "stableSymbol": "USDT",
+    "defiYieldParking": false
+  },
   "execution": {
-    "$comment": "偏离目标权重超过 5 个百分点才触发调仓；单笔最小 20 USDT 避免灰尘单；报价冲击超过 1% 中止",
-    "driftThresholdPp": 5,
+    "$comment": "执行护栏：单笔最小 20 USDT 避免灰尘单；报价冲击超过 1% 中止；默认纸面模式",
     "minTradeUsdt": 20,
     "maxPriceImpactPercent": 1.0,
     "slippagePercent": 0.5,
-    "rebalanceClock": "每天 13:20 UTC（美股盘前）+ 周末加跑一次"
+    "mode": "paper"
   }
 }
