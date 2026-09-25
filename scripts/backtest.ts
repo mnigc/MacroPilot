@@ -6,11 +6,12 @@
  */
 import "dotenv/config";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
-import { fetchMacroBundle } from "../src/data/fred.js";
+import { fetchMacroBundle, MACRO_SERIES } from "../src/data/fred.js";
 import { computeRegimeTimeline, type RegimeConfig } from "../src/strategy/regime.js";
 import { runBacktest } from "../src/backtest/engine.js";
 import { computeMetrics } from "../src/backtest/metrics.js";
 import { parseFredCsv } from "../src/data/stats.js";
+import { getPool, initSchema, loadPricesFromDb, saveBacktestRun, upsertPrices } from "../src/db/index.js";
 
 function loadStrategyConfig() {
   const raw = JSON.parse(readFileSync("config/strategy.json", "utf8")) as {
@@ -46,7 +47,18 @@ function loadStrategyConfig() {
   };
 }
 
-function loadPrices(tickers: string[]): { prices: Map<string, { date: string; value: number }[]>; usedTickers: string[] } {
+async function loadPrices(tickers: string[]): Promise<{ prices: Map<string, { date: string; value: number }[]>; usedTickers: string[]; source: string }> {
+  const db = getPool();
+  const fromDb = await loadPricesFromDb().catch(() => new Map<string, { date: string; value: number }[]>());
+  const availableFromDb = tickers.filter((t) => (fromDb.get(t)?.length ?? 0) > 50);
+  if (availableFromDb.length) {
+    return {
+      prices: new Map(availableFromDb.map((t) => [t, fromDb.get(t) as never])),
+      usedTickers: availableFromDb,
+      source: "postgres",
+    };
+  }
+
   const prices = new Map<string, { date: string; value: number }[]>();
   const dir = "data/prices";
   if (existsSync(dir)) {
@@ -57,16 +69,21 @@ function loadPrices(tickers: string[]): { prices: Map<string, { date: string; va
       if (points.length) prices.set(ticker, points);
     }
   }
-  const available = tickers.filter((t) => prices.has(t));
-  if (available.length === 0) {
-    // 退化：SP500 指数当"篮子"用，验证引擎链路
-    console.warn("⚠ data/prices/ 无可用股价，退化为 SP500 单资产代理（仅验证链路，不代表篮子表现）");
-    return { prices: new Map(), usedTickers: [] };
+  const availableCsv = tickers.filter((t) => prices.has(t));
+  if (availableCsv.length) {
+    // CSV 是 Actions 同步的传输格式：导入 DB 后运行时统一从 DB 读
+    for (const t of availableCsv) await upsertPrices(t, prices.get(t) as never);
+    console.log(`  已将 ${availableCsv.length} 个 CSV 价格文件导入 postgres`);
+    return { prices: new Map(availableCsv.map((t) => [t, prices.get(t) as never])), usedTickers: availableCsv, source: "csv→postgres" };
   }
-  return { prices: new Map(available.map((t) => [t, prices.get(t) as never])), usedTickers: available };
+
+  return { prices: new Map(), usedTickers: [], source: "none" };
 }
 
 const cfg = loadStrategyConfig();
+
+const db = getPool();
+await initSchema();
 
 console.log("拉取 FRED 宏观数据…");
 const bundle = await fetchMacroBundle();
@@ -75,11 +92,28 @@ for (const [k, v] of Object.entries(bundle)) {
   console.log(`  ${k}: ${v.length} 条，最新 ${last?.date} = ${last?.value}`);
 }
 
-const { prices, usedTickers } = loadPrices(cfg.tickers);
+// 宏观序列缓存入库（供前端信号图表复用）
+for (const [key, id] of Object.entries(MACRO_SERIES)) {
+  const points = bundle[key as keyof typeof bundle];
+  if (!points.length) continue;
+  const values: unknown[] = [];
+  const tuples = points.map((p, i) => `($${i * 3 + 1}, $${i * 3 + 2}, $${i * 3 + 3})`);
+  points.forEach((p, i) => values.push(id, p.date, p.value));
+  await db.query(
+    `insert into macro_observations (series, date, value) values ${tuples.join(",")}
+     on conflict (series, date) do update set value = excluded.value`,
+    values,
+  );
+}
+console.log("宏观序列已缓存至 postgres");
+
+const { prices, usedTickers, source } = await loadPrices(cfg.tickers);
 const tickers = usedTickers.length ? usedTickers : ["SP500_PROXY"];
 if (!usedTickers.length) {
+  console.warn("⚠ 无可用股价，退化为 SP500 单资产代理（仅验证链路，不代表篮子表现）");
   prices.set("SP500_PROXY", bundle.trend); // 退化模式
 }
+console.log(`价格数据: ${tickers.join(", ")}（来源 ${source}）`);
 
 mkdirSync("data/backtest", { recursive: true });
 // 股价序列通常比 FRED SP500 短：以最长公共历史为准——直接用体制时间线，价格在缺失期 carry（首日无价则基准延后建仓）
@@ -132,3 +166,23 @@ writeFileSync(
   ),
 );
 console.log("\n已写入 data/backtest/result.json");
+
+const runId = await saveBacktestRun({
+  tickers,
+  params: {
+    weights: cfg.regime.weights,
+    scoreHigh: cfg.regime.scoreHigh,
+    scoreLow: cfg.regime.scoreLow,
+    allocation: cfg.regime.allocation,
+    dcaUsdt: cfg.dcaUsdt,
+    driftThresholdPp: cfg.driftThresholdPp,
+    minTradeUsdt: cfg.minTradeUsdt,
+    costBps: 15,
+  },
+  metrics: { strategy: strat, benchmark: bench },
+  regimeDays: result.regimeDays,
+  finalWeights: result.finalWeights,
+  equity: { strategy: result.strategyEquity, benchmark: result.benchmarkEquity },
+});
+console.log(`回测结果已持久化至 postgres，run id=${runId}`);
+await db.end();

@@ -15,10 +15,12 @@
   },
   "dependencies": {
     "dotenv": "^17.2.1",
+    "pg": "^8.23.0",
     "viem": "^2.32.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.20.0",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4"
