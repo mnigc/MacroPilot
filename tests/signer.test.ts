@@ -1,6 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { authHeaders, buildPreHash, signRequest, utcTimestamp } from "../src/binance/signer.js";
 import { encodeQuery } from "../src/binance/client.js";
+import { parseFredCsv } from "../src/data/stats.js";
+
+describe("FRED CSV 解析", () => {
+  it("跳过假日空值行（Number('') === 0 陷阱）与 '.' 缺失行", () => {
+    const csv = "date,SP500\n2019-11-27,3153.63\n2019-11-28,\n2019-12-25,.\n2019-11-29,3140.98";
+    const points = parseFredCsv(csv);
+    expect(points).toEqual([
+      { date: "2019-11-27", value: 3153.63 },
+      { date: "2019-11-29", value: 3140.98 },
+    ]);
+  });
+});
 
 describe("签名构造", () => {
   const secret = "test-secret";

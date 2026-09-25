@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "smoke": "tsx scripts/smoke.ts",
+    "backtest": "tsx scripts/backtest.ts",
     "agent": "tsx src/run-once.ts"
   },
   "dependencies": {

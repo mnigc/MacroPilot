@@ -1,0 +1,29 @@
+name: sync-data
+
+# 每交易日 UTC 00:30（美股收盘后）同步股价历史并提交，
+# 使回测与展示层的数据可复现——评委 clone 仓库即得完整数据。
+on:
+  schedule:
+    - cron: "30 0 * * 2-6" # 周二到周六（UTC，对应美股收盘后）
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install yfinance pandas
+      - run: python scripts/sync-prices.py
+      - name: commit data
+        run: |
+          git config user.name "data-bot"
+          git config user.email "mnigc@users.noreply.github.com"
+          git add data/prices
+          git diff --cached --quiet || git commit -m "data: sync prices $(date -u +%F)"
+          git push
