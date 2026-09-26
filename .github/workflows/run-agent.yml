@@ -1,8 +1,12 @@
 name: run-agent
 
-# 让"永不停歇"这句话成立：执行器与溢价采集由 CI 每天驱动，不依赖有人手动敲命令。
+# 让"永不停歇"这句话成立：执行器与回测由 CI 每天驱动，不依赖有人手动敲命令。
 # 排在 sync-data（UTC 00:30 推价格）之后一小时，保证决策看到的是当日收盘价。
-# 只有 spread 一步需要币安 API key，且它全程只读（询价，不签名、不广播）。
+#
+# 这里刻意**不含**溢价采集（npm run spread）：币安 Web3 API 对 GitHub runner 的
+# 出口 IP 返回 40304 "Service not available due to compliance restriction"，
+# 换 IPv4 也一样被拦，属于合规侧硬拦截而非偶发。rwa_premiums 的采集改由本机计划任务
+# 负责（scripts/capture-premium.ps1），两条链路各自独立、互不阻塞。
 on:
   schedule:
     - cron: "30 1 * * 2-6" # 周二到周六 UTC，对应美股收盘后的次日凌晨
@@ -16,10 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      # Node 17 起 dns.lookup 默认 verbatim：AAAA 先回来就先试 IPv6，
-      # 而 runner 到 Supabase 所在的 AWS IPv6 段没有路由（connect ENETUNREACH）。
-      # 本地与 Cloudflare 构建机走 IPv4 都正常，故只在此处改回 ipv4first，不污染生产代码。
-      NODE_OPTIONS: --dns-result-order=ipv4first
+      # DATABASE_URL 必须填 Supabase 的 **Session pooler** 连接串（aws-0-<region>.pooler.supabase.com）。
+      # 直连主机 db.<ref>.supabase.co 只有 AAAA 记录，而 runner 到那段 AWS IPv6 无路由，
+      # 会崩在 connect ENETUNREACH；pooler 有 A 记录，走 IPv4 即可。
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      EXECUTION_MODE: paper # 钉死纸面：这条链路碰真钱，不依赖默认值
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -29,25 +34,10 @@ jobs:
 
       - run: npm ci
 
-      # 探针：币安 Web3 API 对 GitHub runner 的出口 IP 是否放行。
-      # 这一步失败不影响后面的决策与回测，故 continue-on-error。
-      - name: 采集链上可成交溢价
-        continue-on-error: true
-        env:
-          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
-          BINANCE_SECRET_KEY: ${{ secrets.BINANCE_SECRET_KEY }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run spread
-
       - name: 执行器跑一轮（paper）
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          EXECUTION_MODE: paper
         run: npm run agent
 
       - name: 重跑回测
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run backtest
 
       # 站点是构建期读库的静态产物，写库不会自己刷新页面；落一个时间戳文件并 push，
@@ -62,6 +52,6 @@ jobs:
           git add web/public/last-run.txt
           git diff --cached --quiet && { echo "无变化，跳过"; exit 0; }
           git commit -m "chore: agent run $(date -u +%F)"
-          # 与 sync-data 的提交可能撞车，rebase 后再推
+          # 与 sync-data / 本机溢价采集的提交可能撞车，rebase 后再推
           git pull --rebase origin main
           git push origin HEAD:main
