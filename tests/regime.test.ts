@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeRegimeTimeline, type MacroBundle, type RegimeConfig } from "../src/strategy/regime.js";
+import { computeRegimeTimeline, nextRegime, type MacroBundle, type RegimeConfig } from "../src/strategy/regime.js";
 import type { Point } from "../src/data/stats.js";
 
 /**
@@ -30,8 +30,38 @@ const cfg: RegimeConfig = {
   weights: { liquidity: 0.3, volatility: 0.3, rates: 0.2, trend: 0.2 },
   scoreHigh: 0.6,
   scoreLow: 0.3,
+  scoreRelease: 0.45,
   allocation: { riskOn: 1.0, neutral: 0.6, riskOff: 0.25 },
 };
+
+describe("体制状态机（三态滞回）", () => {
+  it("进入极态需越过外沿，回落/回升到中性需越过内沿", () => {
+    expect(nextRegime(0.61, "neutral", cfg)).toBe("riskOn");
+    expect(nextRegime(0.5, "riskOn", cfg)).toBe("riskOn"); // 间隙内保持，不抖
+    expect(nextRegime(0.44, "riskOn", cfg)).toBe("neutral"); // 越过 release 才降档
+    expect(nextRegime(0.29, "neutral", cfg)).toBe("riskOff");
+    expect(nextRegime(0.35, "riskOff", cfg)).toBe("riskOff");
+    expect(nextRegime(0.46, "riskOff", cfg)).toBe("neutral");
+  });
+
+  it("极态之后分数回到中间带必须能落回 neutral（回归：曾因缺少释放边沿而永久不可达）", () => {
+    const seq = [0.7, 0.65, 0.5, 0.4, 0.2, 0.35, 0.5, 0.7];
+    const seen: string[] = [];
+    let state: "riskOn" | "neutral" | "riskOff" = "neutral";
+    for (const s of seq) {
+      state = nextRegime(s, state, cfg);
+      seen.push(state);
+    }
+    expect(seen).toEqual(["riskOn", "riskOn", "riskOn", "neutral", "riskOff", "riskOff", "neutral", "riskOn"]);
+    expect(seen).toContain("neutral");
+  });
+
+  it("未配置 scoreRelease 时取两阈值中点", () => {
+    const noRelease = { scoreHigh: 0.6, scoreLow: 0.2 };
+    expect(nextRegime(0.35, "riskOn", noRelease)).toBe("neutral"); // 中点 0.4
+    expect(nextRegime(0.45, "riskOn", noRelease)).toBe("riskOn");
+  });
+});
 
 const N = 1100;
 const SHIFT = 650; // 前 650 天平静，后 450 天加速转变

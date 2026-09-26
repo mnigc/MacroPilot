@@ -159,6 +159,8 @@ export function ScoreChart(props: {
   bands: Band[];
   scoreHigh: number;
   scoreLow: number;
+  /** 释放阈值：极态回落到 neutral 的内沿，缺省不画 */
+  scoreRelease?: number;
   short?: boolean;
 }) {
   const ref = useChart(
@@ -206,19 +208,20 @@ export function ScoreChart(props: {
             silent: true,
             symbol: "none",
             animation: false,
-            label: {
-              color: "#7d8590",
-              position: "insideEndTop",
-              fontSize: 10.5,
-              formatter: (p: { value: number }) => (p.value === props.scoreHigh ? "risk-on ≥" : "risk-off ≤"),
-            },
+            label: { color: "#7d8590", position: "insideEndTop", fontSize: 10.5 },
             lineStyle: { type: "dashed", color: "#4a525c" },
-            data: [{ yAxis: props.scoreHigh }, { yAxis: props.scoreLow }],
+            data: [
+              { yAxis: props.scoreHigh, label: { formatter: "risk-on ≥" } },
+              { yAxis: props.scoreLow, label: { formatter: "risk-off ≤" } },
+              ...(props.scoreRelease
+                ? [{ yAxis: props.scoreRelease, lineStyle: { color: "#b56ef0" }, label: { formatter: "↩ 回到 neutral" } }]
+                : []),
+            ],
           },
         },
       ],
     },
-    [props.points, props.bands, props.scoreHigh, props.scoreLow],
+    [props.points, props.bands, props.scoreHigh, props.scoreLow, props.scoreRelease],
   );
   return <div ref={ref} className={props.short ? "chart-box short" : "chart-box"} />;
 }

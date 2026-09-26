@@ -7,15 +7,21 @@
     "node": ">=22"
   },
   "scripts": {
+    "dev": "npm --prefix web run dev",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "smoke": "tsx scripts/smoke.ts",
+    "spread": "tsx scripts/spread.ts",
+    "wallet": "tsx scripts/wallet.ts",
     "backtest": "tsx scripts/backtest.ts",
-    "agent": "tsx src/run-once.ts"
+    "agent": "tsx src/run-once.ts",
+    "web:build": "npm --prefix web run build",
+    "preview": "npm --prefix web run preview"
   },
   "dependencies": {
     "dotenv": "^17.2.1",
     "pg": "^8.23.0",
+    "undici": "^8.11.2",
     "viem": "^2.32.0"
   },
   "devDependencies": {

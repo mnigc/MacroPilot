@@ -6,4 +6,8 @@ import react from "@astrojs/react";
 export default defineConfig({
   output: "static",
   integrations: [react()],
+  vite: {
+    // ECharts 体积大，dev 冷启动显式预打包，避免首次请求 30s 级编译
+    optimizeDeps: { include: ["echarts"] },
+  },
 });

@@ -1,6 +1,13 @@
 import { authHeaders } from "./signer.js";
+import { fetch as undiciFetch, ProxyAgent } from "undici";
 
 export const BASE_URL = "https://web3.binance.com/build";
+
+// 网络环境适配：直连不可达时经 HTTPS_PROXY/HTTP_PROXY 代理访问（Node 全局 fetch 不读代理环境变量，
+// 且内置 undici 与外部 undici 的 dispatcher 不通用，故成对使用安装版 undiciFetch + ProxyAgent）
+const proxyUrl =
+  process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy;
+const proxyDispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
 
 /** 统一响应信封：{ code, msg, data, timestamp, success }，code=0 表示成功 */
 export interface OCResult<T> {
@@ -55,21 +62,36 @@ export class BinanceWeb3Client {
     attempt = 0,
   ): Promise<T> {
     const query = encodeQuery(params);
-    // requestPath 参与签名：/build 前缀 + 原始编码 query，与实际发送的完全一致
-    const requestPath = `${BASE_URL}${path}${query}`;
+    // 签名与请求双轨：签名用 requestPath（/build 前缀 + 原始编码 query，不含 scheme/host），
+    // 请求用完整 URL。官方文档：preHash 四段 = timestamp + METHOD + requestPath + body
+    const signedPath = `/build${path}${query}`;
+    const requestUrl = `${BASE_URL}${path}${query}`;
     const body = json === undefined ? "" : JSON.stringify(json);
     const headers: Record<string, string> = {
-      ...authHeaders(this.apiKey, this.secretKey, method, requestPath, body),
+      ...authHeaders(this.apiKey, this.secretKey, method, signedPath, body),
+      // 限定 gzip：外部 undici 会请求 zstd，而 Node 22.13 的 zlib 尚无 zstd 解压
+      "Accept-Encoding": "gzip",
     };
     if (body) headers["Content-Type"] = "application/json";
 
     const timeoutMs = this.limits.timeoutMs ?? 15_000;
-    const res = await fetch(requestPath, {
-      method,
-      headers,
-      body: body || undefined,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    let res: Awaited<ReturnType<typeof undiciFetch>>;
+    try {
+      res = await undiciFetch(requestUrl, {
+        method,
+        headers,
+        body: body || undefined,
+        signal: AbortSignal.timeout(timeoutMs),
+        ...(proxyDispatcher ? { dispatcher: proxyDispatcher } : {}),
+      } as Parameters<typeof undiciFetch>[1]);
+    } catch (err) {
+      // 网络层瞬断（代理抖动/TLS 中断）重试一次；429 之外的业务错误不在此处理
+      if (attempt < (this.limits.maxRetries ?? 2)) {
+        await sleep(1200);
+        return this.request<T>(method, path, params, json, attempt + 1);
+      }
+      throw err;
+    }
 
     if (res.status === 429) {
       const retryAfter = Number(res.headers.get("Retry-After") ?? "2");

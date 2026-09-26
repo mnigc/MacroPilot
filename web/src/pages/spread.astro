@@ -1,0 +1,78 @@
+---
+import Base from "../layouts/Base.astro";
+import { getLatestPremiums } from "../lib/db";
+
+const snap = await getLatestPremiums();
+const rows = snap?.rows ?? [];
+const pct = (v: number | null, digits = 3) => (v === null || v === undefined ? "—" : `${(v * 100).toFixed(digits)}%`);
+const maxAbs = Math.max(0.001, ...rows.map((r) => Math.abs(r.premium ?? 0)));
+const capturedLabel = snap ? new Date(snap.capturedAt).toISOString().replace("T", " ").slice(0, 19) + " UTC" : "—";
+---
+<Base active="spread">
+  <div class="hero reveal" style="padding-bottom:0">
+    <h1>链上<span class="grad">溢价监控</span></h1>
+    <p>同一股英伟达，链上代币比美股官方价贵多少？这个差价是代币化股票独有的实时情绪信号</p>
+  </div>
+
+  <div class="card reveal d1 accent-top" style="margin-top:22px; border-color: rgba(240,185,11,0.22)">
+    <h3 style="color: var(--accent)">◆ 口径说明：为什么不能直接拿"链上价"减"参考价"</h3>
+    <p class="text">
+      RWA 数据端点确实同时返回 <code>tokenPrice</code> 与 <code>referencePrice</code>，但实测（2026-09-26，Mag7 全部命中）
+      存在恒等式 <b>tokenPrice ≡ referencePrice × tokenToShareRatio</b> —— 前者是发行方的<b>净值标记</b>，不含盘口，
+      拿它减参考价得到的价差恒等于份额比，7 只标的的"每股溢价"全部精确为 0.000%。
+    </p>
+    <p class="text">
+      真正的链上价格只能问<b>聚合器询价</b>：用固定 50 USDT 买入该代币，用报价的付出/到手数量反推可成交单价，
+      再按 <code>tokenToShareRatio</code> 折算到"每股"口径，与官方参考价比 —— 下面这张表的数就是这么来的。
+      溢价走高＝链上抢筹，走低甚至转负＝链上折价，是定投引擎可以用的加仓时机信号。
+    </p>
+    <div class="faint">快照 {snap?.snapshots ?? 0} 轮 · 最近采集 {capturedLabel} · 采集方式 <code>npm run spread</code>（只询价，不签名不广播）</div>
+  </div>
+
+  <div class="section-title reveal d2">当前溢价 · 每股口径</div>
+  <div class="card reveal d2">
+    {rows.map((r) => {
+      const p = r.premium ?? 0;
+      const w = (Math.abs(p) / maxAbs) * 100;
+      const color = p >= 0 ? "#f6465d" : "#2ebd85";
+      return (
+        <div class="signal-row">
+          <span class="name" style="width:110px">{r.ticker}<span class="faint" style="font-weight:400"> · {r.symbol}</span></span>
+          <div class="bar"><div class="fill" style={`--w: ${w}%; background: linear-gradient(90deg, ${color}55, ${color}); box-shadow: 0 0 10px ${color}44;`}></div></div>
+          <span class="num" style={`color: ${color}`}>{pct(r.premium)}</span>
+        </div>
+      );
+    })}
+    {rows.length === 0 && <div class="faint">暂无快照 —— 配置 .env 后运行 <code>npm run spread</code></div>}
+    <div class="faint" style="margin-top:10px">红＝链上比美股贵（追高成本），绿＝链上折价（相对便宜）。刻度按本轮最大绝对值归一。</div>
+  </div>
+
+  <div class="section-title reveal d3">明细 · 三种价格并排</div>
+  <div class="card reveal d3">
+    <table>
+      <thead>
+        <tr><th>标的</th><th>代币</th><th>发行平台</th><th>官方参考价</th><th>净值标记</th><th>可成交单价</th><th>溢价</th><th>冲击成本</th><th>询价路由</th></tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr>
+            <td>{r.ticker}</td>
+            <td class="text">{r.symbol}</td>
+            <td class="text">{r.platform}</td>
+            <td>{r.reference_price?.toFixed(3) ?? "—"}</td>
+            <td class="faint">{r.mark_price?.toFixed(3) ?? "—"}</td>
+            <td>{r.executable_price?.toFixed(3) ?? "—"}</td>
+            <td class={(r.premium ?? 0) >= 0 ? "down" : "up"}>{pct(r.premium)}</td>
+            <td>{r.impact_pct === null ? "—" : `${r.impact_pct.toFixed(3)}%`}</td>
+            <td class="text faint">{[r.vendor, r.dex].filter(Boolean).join(" / ") || "—"}</td>
+          </tr>
+        ))}
+        {rows.length === 0 && <tr><td colspan="9" class="text faint">暂无记录</td></tr>}
+      </tbody>
+    </table>
+    <div class="faint" style="margin-top:10px">
+      "净值标记"列刻意保留：它与参考价之间没有信息量（差值＝份额比），放在这里是作为反面教材 ——
+      接一个数据源之前，先验证它的两个字段是不是同一个数的两种写法。
+    </div>
+  </div>
+</Base>

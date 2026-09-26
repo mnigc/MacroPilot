@@ -2,6 +2,7 @@
 import Base from "../layouts/Base.astro";
 import { ScoreChart, SignalChart, EquityChart } from "../components/charts";
 import { regimeBands, REGIME_LABEL } from "../lib/bands";
+import { DRIVER_LABEL, parseDrivers } from "../lib/drivers";
 import {
   getLatestRun,
   getRegimePoints,
@@ -174,7 +175,11 @@ const engines = [
               <td>{t.ticker}</td>
               <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
               <td>{fmtUsd(t.notional_usdt)}</td>
-              <td class="text"><span class={`pill ${t.reason}`}>{t.reason === "dca" ? "定投" : t.reason === "regime" ? "体制" : "漂移"}</span></td>
+              <td class="text">
+                {parseDrivers(t.reason).map((d) => (
+                  <span class={`pill ${d}`}>{DRIVER_LABEL[d]}</span>
+                ))}
+              </td>
             </tr>
           ))}
           {paperTrades.length === 0 && <tr><td colspan="5" class="text faint">暂无交易 —— 运行 npm run agent 开始</td></tr>}

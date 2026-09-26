@@ -1,5 +1,7 @@
 import { Pool } from "pg";
 import type { Point } from "../data/stats.js";
+import type { PremiumRow } from "../binance/premium.js";
+import { joinDrivers, type TradeDriver } from "../strategy/drivers.js";
 
 /**
  * Supabase Postgres：价格、宏观数据缓存、回测结果、交易记录的持久层。
@@ -76,6 +78,30 @@ export async function initSchema(): Promise<void> {
       earnings_date date not null,
       primary key (ticker, earnings_date)
     );
+    create table if not exists runtime_state (
+      mode text primary key,
+      regime text not null,
+      equity_target double precision not null,
+      score double precision not null,
+      as_of date not null,
+      updated_at timestamptz not null default now()
+    );
+    -- 链上可成交溢价快照：数据端点的 tokenPrice 是净值标记（无盘口），溢价只能来自聚合器询价
+    create table if not exists rwa_premiums (
+      captured_at timestamptz not null,
+      ticker text not null,
+      symbol text not null,
+      platform text not null default '',
+      address text not null,
+      reference_price double precision,
+      mark_price double precision,
+      executable_price double precision,
+      premium double precision,
+      impact_pct double precision,
+      vendor text,
+      dex text,
+      primary key (captured_at, ticker)
+    );
   `);
 }
 
@@ -148,7 +174,7 @@ export async function saveRegimePoints(
 
 export async function saveTrades(
   runId: number,
-  trades: { date: string; ticker: string; unitsDelta: number; notionalUsdt: number; reason: string }[],
+  trades: { date: string; ticker: string; unitsDelta: number; notionalUsdt: number; drivers: TradeDriver[] }[],
 ): Promise<void> {
   const db = getPool();
   const CHUNK = 8000; // 每行 6 个参数，8000 行 = 48,000 < 65,535 上限
@@ -156,7 +182,7 @@ export async function saveTrades(
     const chunk = trades.slice(i, i + CHUNK);
     const values: unknown[] = [];
     const tuples = chunk.map((t, j) => {
-      values.push(runId, t.date, t.ticker, t.unitsDelta, t.notionalUsdt, t.reason);
+      values.push(runId, t.date, t.ticker, t.unitsDelta, t.notionalUsdt, joinDrivers(t.drivers));
       const b = j * 6;
       return `('backtest', $${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6})`;
     });
@@ -248,12 +274,74 @@ export async function upcomingEarnings(tickers: string[], asOf: string): Promise
 
 export async function recordTrades(
   mode: string,
-  trades: { date: string; ticker: string; unitsDelta: number; notionalUsdt: number; reason: string }[],
+  trades: { date: string; ticker: string; unitsDelta: number; notionalUsdt: number; drivers: TradeDriver[] }[],
 ): Promise<void> {
   for (const t of trades) {
     await getPool().query(
       "insert into trades (mode, date, ticker, units_delta, notional_usdt, reason) values ($1, $2, $3, $4, $5, $6)",
-      [mode, t.date, t.ticker, t.unitsDelta, t.notionalUsdt, t.reason],
+      [mode, t.date, t.ticker, t.unitsDelta, t.notionalUsdt, joinDrivers(t.drivers)],
     );
   }
+}
+
+/**
+ * 执行器运行态：记录上一轮的体制与目标仓位，使本轮能判断"体制是否切换"——
+ * 没有这份状态，执行器只能看到瞬时分数，归因里 regime 这一档永远不成立。
+ */
+export interface RuntimeState {
+  regime: string;
+  equityTarget: number;
+  score: number;
+  asOf: string;
+}
+
+export async function loadRuntimeState(mode: string): Promise<RuntimeState | null> {
+  const { rows } = await getPool().query<RuntimeState>(
+    "select regime, equity_target as \"equityTarget\", score, to_char(as_of, 'YYYY-MM-DD') as \"asOf\" from runtime_state where mode = $1",
+    [mode],
+  );
+  return rows[0] ?? null;
+}
+
+export async function saveRuntimeState(mode: string, state: RuntimeState): Promise<void> {
+  await getPool().query(
+    `insert into runtime_state (mode, regime, equity_target, score, as_of, updated_at)
+     values ($1, $2, $3, $4, $5, now())
+     on conflict (mode) do update set regime = excluded.regime, equity_target = excluded.equity_target,
+       score = excluded.score, as_of = excluded.as_of, updated_at = now()`,
+    [mode, state.regime, state.equityTarget, state.score, state.asOf],
+  );
+}
+
+/** 一轮溢价快照：同一 captured_at 下每个 ticker 一行（采集时刻由调用方决定，便于事后对齐） */
+export async function savePremiumSnapshot(capturedAt: string, rows: PremiumRow[]): Promise<number> {
+  if (!rows.length) return 0;
+  const db = getPool();
+  let n = 0;
+  for (const r of rows) {
+    const res = await db.query(
+      `insert into rwa_premiums (captured_at, ticker, symbol, platform, address, reference_price, mark_price, executable_price, premium, impact_pct, vendor, dex)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       on conflict (captured_at, ticker) do update set symbol = excluded.symbol, platform = excluded.platform,
+         address = excluded.address, reference_price = excluded.reference_price, mark_price = excluded.mark_price,
+         executable_price = excluded.executable_price, premium = excluded.premium, impact_pct = excluded.impact_pct,
+         vendor = excluded.vendor, dex = excluded.dex`,
+      [
+        capturedAt,
+        r.ticker,
+        r.symbol,
+        r.platform,
+        r.address,
+        r.referencePrice,
+        r.markPrice,
+        r.executablePrice,
+        r.premium,
+        r.impactPercent,
+        r.vendor,
+        r.dex,
+      ],
+    );
+    n += res.rowCount ?? 0;
+  }
+  return n;
 }

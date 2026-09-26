@@ -17,9 +17,10 @@
       "amountUsdt": 50
     },
     "regime": {
-      "$comment": "体制引擎（风险内核）：四信号加权 → 综合分，>=high risk-on / <=low risk-off / 区间内保持（滞回防翻转）",
+      "$comment": "体制引擎（风险内核）：四信号加权 → 综合分。>=scoreHigh risk-on / <=scoreLow risk-off；从极态回到 neutral 需越过 scoreRelease（三态滞回，缺省取两阈值中点）。无 release 边沿时 neutral 只有初始值、离开后永久不可达",
       "scoreHigh": 0.6,
       "scoreLow": 0.3,
+      "scoreRelease": 0.45,
       "allocation": { "riskOn": 1.0, "neutral": 0.6, "riskOff": 0.25 },
       "signals": {
         "liquidity": { "$comment": "美联储资产负债表 13 周变化", "fredSeries": "WALCL", "weight": 0.3 },

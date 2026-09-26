@@ -18,7 +18,7 @@ function loadStrategyConfig() {
     basket: { tickers: string[] };
     engines: {
       dca: { amountUsdt: number };
-      regime: { scoreHigh: number; scoreLow: number; allocation: Record<string, number>; signals: Record<string, { weight: number }> };
+      regime: { scoreHigh: number; scoreLow: number; scoreRelease?: number; allocation: Record<string, number>; signals: Record<string, { weight: number }> };
       drift: { thresholdPp: number };
     };
     execution: { minTradeUsdt: number; costBps?: number };
@@ -38,6 +38,7 @@ function loadStrategyConfig() {
       },
       scoreHigh: raw.engines.regime.scoreHigh,
       scoreLow: raw.engines.regime.scoreLow,
+      scoreRelease: raw.engines.regime.scoreRelease ?? 0.45,
       allocation: {
         riskOn: raw.engines.regime.allocation.riskOn ?? 1.0,
         neutral: raw.engines.regime.allocation.neutral ?? 0.6,
@@ -125,6 +126,30 @@ const regimeCount = timeline.reduce<Record<string, number>>((acc, p) => {
   return acc;
 }, {});
 console.log("  体制分布:", regimeCount);
+
+// 综合分分布：用于判断三态阈值是否真的把分数空间切成了三段（neutral 是否有交易日落在其中）
+const q = (sorted: number[], p: number) => sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] ?? NaN;
+const scores = timeline.map((p) => p.score).sort((a, b) => a - b);
+const mean = (xs: number[]) => xs.reduce((s, v) => s + v, 0) / (xs.length || 1);
+console.log(
+  `  综合分分布: p5=${q(scores, 0.05).toFixed(3)} p25=${q(scores, 0.25).toFixed(3)} 中位=${q(scores, 0.5).toFixed(3)} ` +
+    `p75=${q(scores, 0.75).toFixed(3)} p95=${q(scores, 0.95).toFixed(3)} 区间=[${scores[0]?.toFixed(3)}, ${scores[scores.length - 1]?.toFixed(3)}]`,
+);
+console.log(
+  `  瞬时信号落在阈值区间内(scoreLow<score<scoreHigh)的天数: ${timeline.filter((p) => p.score > cfg.regime.scoreLow && p.score < cfg.regime.scoreHigh).length} / ${timeline.length}` +
+    `（三态滞回下 neutral 还要越过 release 内沿才可达——缺 release 边沿时 neutral 恒为 0 天）`,
+);
+console.log(
+  "  信号分量均值: " +
+    Object.entries({
+      liquidity: mean(timeline.map((p) => p.signals.liquidity)),
+      volatility: mean(timeline.map((p) => p.signals.volatility)),
+      rates: mean(timeline.map((p) => p.signals.rates)),
+      trend: mean(timeline.map((p) => p.signals.trend)),
+    })
+      .map(([k, v]) => `${k}=${v.toFixed(3)}`)
+      .join(" "),
+);
 const lastPoint = timeline[timeline.length - 1];
 if (lastPoint) {
   console.log(`  当前: score=${lastPoint.score.toFixed(3)} regime=${lastPoint.regime} 目标仓位=${lastPoint.equityTarget * 100}%`);
@@ -173,6 +198,7 @@ const runId = await saveBacktestRun({
     weights: cfg.regime.weights,
     scoreHigh: cfg.regime.scoreHigh,
     scoreLow: cfg.regime.scoreLow,
+    scoreRelease: cfg.regime.scoreRelease,
     allocation: cfg.regime.allocation,
     dcaUsdt: cfg.dcaUsdt,
     driftThresholdPp: cfg.driftThresholdPp,

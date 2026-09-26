@@ -19,9 +19,16 @@ export interface SignalWeights {
 
 export interface RegimeConfig {
   weights: SignalWeights;
-  /** 综合分 ≥ scoreHigh → risk-on；≤ scoreLow → risk-off；区间内保持原状态（滞回防频繁翻转） */
+  /** 综合分 ≥ scoreHigh → risk-on；≤ scoreLow → risk-off */
   scoreHigh: number;
   scoreLow: number;
+  /**
+   * 释放阈值（中性态的入口）：处于 risk-on 时跌破 scoreRelease 才降为 neutral，
+   * 处于 risk-off 时升破 scoreRelease 才升为 neutral。缺省取两阈值的中点。
+   * 没有这一条，滞回就只有"进入极态"的边沿、没有"离开极态"的边沿——
+   * neutral 会退化成仅初始值、一旦离开便永久不可达（本项目 D1 实测 0 天）。
+   */
+  scoreRelease?: number;
   /** risk-on/neutral/risk-off 对应的目标股票仓位 */
   allocation: Record<Regime, number>;
 }
@@ -47,6 +54,24 @@ const CHANGE_LAG = 65; // 变化窗口 ≈ 13 周
 const VOL_TREND_LAG = 20; // VIX 短趋势 ≈ 1 个月
 const SMA_WINDOW = 200; // 长趋势均线
 const WARMUP = RANK_WINDOW + CHANGE_LAG + 1; // 第一个可用信号日
+
+/**
+ * 三态滞回（Schmitt 触发）单步：进入极态要越过外沿，回到中性要越过内沿 release。
+ * 独立成函数是因为这条规则本身出过 bug——只写"进入极态"边沿时 neutral 一旦离开
+ * 便永久不可达（实测 0 天），因此必须可被单测钉住。
+ */
+export function nextRegime(
+  score: number,
+  prev: Regime,
+  cfg: Pick<RegimeConfig, "scoreHigh" | "scoreLow" | "scoreRelease">,
+): Regime {
+  const release = cfg.scoreRelease ?? (cfg.scoreHigh + cfg.scoreLow) / 2;
+  if (score >= cfg.scoreHigh) return "riskOn";
+  if (score <= cfg.scoreLow) return "riskOff";
+  if (prev === "riskOn" && score < release) return "neutral";
+  if (prev === "riskOff" && score > release) return "neutral";
+  return prev;
+}
 
 /**
  * 体制时间线：每个交易日输出综合分与目标仓位。
@@ -135,9 +160,7 @@ export function computeRegimeTimeline(bundle: MacroBundle, cfg: RegimeConfig): R
       cfg.weights.rates * rateScore +
       cfg.weights.trend * trendScore;
 
-    // 滞回状态机：只有明确越过阈值才切换，区间内保持——这是低换手的关键
-    if (score >= cfg.scoreHigh) regime = "riskOn";
-    else if (score <= cfg.scoreLow) regime = "riskOff";
+    regime = nextRegime(score, regime, cfg);
 
     out.push({
       date,

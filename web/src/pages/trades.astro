@@ -1,17 +1,17 @@
 ---
 import Base from "../layouts/Base.astro";
 import { getTrades } from "../lib/db";
+import { DRIVER_LABEL, parseDrivers } from "../lib/drivers";
 
 const paperTrades = await getTrades("paper", 200);
 const backtestTrades = await getTrades("backtest", 60);
 
-const reasonLabel = (r: string) => (r === "dca" ? "定投" : r === "regime" ? "体制" : "漂移");
 const fmt = (v: number) => `$${Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
 ---
 <Base active="trades">
   <div class="hero reveal" style="padding-bottom:0">
     <h1>交易<span class="grad">流水</span></h1>
-    <p>每一笔成交都标注触发引擎 —— 定投 · 体制 · 漂移，未来 live 模式的 RFQ 真实成交同样入账</p>
+    <p>每一笔成交标注<b>全部</b>触发引擎 —— 定投 · 体制 · 漂移 · 财报可同日共触发，未来 live 模式的 RFQ 真实成交同样入账</p>
   </div>
 
   <div class="section-title reveal d1" style="margin-top: 26px">Paper 执行记录 <span class="faint" style="font-weight:400">{paperTrades.length} 笔 · 每次运行 npm run agent 产生</span></div>
@@ -26,7 +26,7 @@ const fmt = (v: number) => `$${Math.abs(v).toLocaleString("en-US", { maximumFrac
             <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
             <td>{Math.abs(t.units_delta).toFixed(4)}</td>
             <td>{fmt(t.notional_usdt)}</td>
-            <td class="text"><span class={`pill ${t.reason}`}>{reasonLabel(t.reason)}</span></td>
+            <td class="text">{parseDrivers(t.reason).map((d) => <span class={`pill ${d}`}>{DRIVER_LABEL[d]}</span>)}</td>
           </tr>
         ))}
         {paperTrades.length === 0 && <tr><td colspan="6" class="text faint">暂无记录</td></tr>}
@@ -45,7 +45,7 @@ const fmt = (v: number) => `$${Math.abs(v).toLocaleString("en-US", { maximumFrac
             <td>{t.ticker}</td>
             <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
             <td>{fmt(t.notional_usdt)}</td>
-            <td class="text"><span class={`pill ${t.reason}`}>{reasonLabel(t.reason)}</span></td>
+            <td class="text">{parseDrivers(t.reason).map((d) => <span class={`pill ${d}`}>{DRIVER_LABEL[d]}</span>)}</td>
           </tr>
         ))}
         {backtestTrades.length === 0 && <tr><td colspan="5" class="text faint">暂无记录 —— 运行 npm run backtest</td></tr>}

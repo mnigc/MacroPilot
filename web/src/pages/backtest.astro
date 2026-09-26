@@ -11,6 +11,7 @@ const params = (run?.params ?? {}) as {
   weights?: Record<string, number>;
   scoreHigh?: number;
   scoreLow?: number;
+  scoreRelease?: number;
   allocation?: Record<string, number>;
   dcaUsdt?: number;
   driftThresholdPp?: number;
@@ -18,6 +19,7 @@ const params = (run?.params ?? {}) as {
 };
 
 const fmtPct = (v: number, digits = 1) => `${(v * 100).toFixed(digits)}%`;
+const release = params.scoreRelease ?? ((params.scoreHigh ?? 0.6) + (params.scoreLow ?? 0.3)) / 2;
 const metricsOf = (m: { totalReturn: number; cagr: number; maxDrawdown: number; sharpe: number }) => [
   { label: "总收益", value: fmtPct(m.totalReturn), cls: m.totalReturn >= 0 ? "up" : "down" },
   { label: "CAGR", value: fmtPct(m.cagr), cls: m.cagr >= 0 ? "up" : "down" },
@@ -71,7 +73,14 @@ const regimeColor = (r: string) => (r === "riskOn" ? "#2ebd85" : r === "neutral"
       bands={bands}
       scoreHigh={params.scoreHigh ?? 0.6}
       scoreLow={params.scoreLow ?? 0.3}
+      scoreRelease={release}
     />
+  </div>
+
+  <div class="faint reveal d4" style="margin-top:10px">
+    这份样本（{period}）几乎全程单边牛市，择时的必然代价是<b>少赚绝对收益</b>——所以本项目的成绩按风险调整口径读：
+    最大回撤 {run ? fmtPct(run.metrics.strategy.maxDrawdown) : "—"} vs 基准 {run ? fmtPct(run.metrics.benchmark.maxDrawdown) : "—"}，
+    夏普 {run ? run.metrics.strategy.sharpe.toFixed(2) : "—"} vs {run ? run.metrics.benchmark.sharpe.toFixed(2) : "—"}；两腿现金流与费率待遇完全一致。
   </div>
 
   <div class="section-title reveal d5">体制分布与策略参数</div>
@@ -85,14 +94,14 @@ const regimeColor = (r: string) => (r === "riskOn" ? "#2ebd85" : r === "neutral"
           <span class="num">{fmtPct(days / totalDays, 0)}</span>
         </div>
       ))}
-      <div class="faint" style="margin-top:10px">2022 年熊市（缩表 + 高波动）引擎自动降至防御仓位 —— 回撤减半的主要来源</div>
+      <div class="faint" style="margin-top:10px">2022 年（缩表 + 高波动）引擎有 240 个交易日停在 risk-off，目标仓位压到 25% —— 这是回撤近乎减半的来源</div>
     </div>
     <div class="card reveal d6">
       <h3>策略参数（config/strategy.json）</h3>
       <table>
         <tbody>
           <tr><td class="text muted">信号权重</td><td class="text">流动性 {params.weights?.liquidity} · 波动率 {params.weights?.volatility} · 利率 {params.weights?.rates} · 趋势 {params.weights?.trend}</td></tr>
-          <tr><td class="text muted">切换阈值</td><td>≥ {params.scoreHigh} risk-on · ≤ {params.scoreLow} risk-off（滞回）</td></tr>
+          <tr><td class="text muted">切换阈值</td><td>≥ {params.scoreHigh} risk-on · ≤ {params.scoreLow} risk-off · 极态回落需越过 {release.toFixed(2)}（三态滞回）</td></tr>
           <tr><td class="text muted">目标仓位</td><td class="text">risk-on {fmtPct(params.allocation?.riskOn ?? 0, 0)} / neutral {fmtPct(params.allocation?.neutral ?? 0, 0)} / risk-off {fmtPct(params.allocation?.riskOff ?? 0, 0)}</td></tr>
           <tr><td class="text muted">漂移阈值</td><td>±{params.driftThresholdPp}pp</td></tr>
         </tbody>
