@@ -2,6 +2,8 @@
 
 > BNB Hack: 代币化股票专题（16 Sep – 11 Oct 2026）参赛项目
 >
+> **在线演示：https://macro-bnb.soulcreator.cn** ｜ 数据新鲜度自查：https://macro-bnb.soulcreator.cn/last-run.txt
+>
 > 用一句话说清楚：**一个永不停歇的链上 robo-advisor——定投买入你的股票篮子，财报前自动避险，宏观转冷自动降仓，周末照常工作。**
 
 ## 产品定义：四个策略引擎，一个执行器
@@ -72,6 +74,7 @@
 | 同一 ticker 多枚链上代币的可成交性选币 | 已实现，离线测试用 MSFT 真实两枚地址锁住行为（`tests/tokens.test.ts`） |
 | EIP-712 本地签名、载荷归一化、报价选单 | 已实现并有离线验签测试（不依赖网络与资金） |
 | 执行链路真实广播（SWAP 上链 / RFQ 撮合往返） | 代码已接好，**尚未真实下过单**：需要一只充值后的小额专用钱包（当前 `.env` 的 `WALLET_PRIVATE_KEY` 为空，`npm run wallet` 会列出准备清单） |
+| 站点部署 + CI 每日驱动（决策 → 写库 → 触发重建） | 已上线并端到端验证：2026-09-26 CI 产出 backtest run 14，push 后线上 `/last-run.txt` 与 `/api/backtest.json` 同步刷新 |
 | 财报引擎 | 在执行器生效；因免费源无法回溯 6.5 年历史财报日，**不参与回测** |
 
 一处重要的口径纠正：币安 RWA 数据端点的 `tokenPrice` 实测恒等于 `referencePrice × tokenToShareRatio`
@@ -115,7 +118,9 @@ CSV 随仓库分发，clone 即得。
 
 ## 可视化平台（web/）
 
-Astro + React + ECharts，与 invest-platform 同栈。静态构建时直读 Supabase Postgres：
+Astro + React + ECharts，与 invest-platform 同栈。**线上：https://macro-bnb.soulcreator.cn**
+（Cloudflare Workers Builds 托管静态产物：根目录 `web`、构建 `npm run build`、部署 `npx wrangler deploy`，
+配置见 `web/wrangler.jsonc`）。静态构建时直读 Supabase Postgres：
 
 - **仪表盘 `/`**：paper 组合净值、当前体制徽章与综合分、四信号分量、四引擎状态卡、持仓权重、最近交易
 - **回测 `/backtest`**：策略 vs 买入持有指标对比、净值曲线（体制色带 + 缩放）、宏观综合分与切换阈值、体制时间占比、参数表
@@ -123,8 +128,16 @@ Astro + React + ECharts，与 invest-platform 同栈。静态构建时直读 Sup
 - **链上溢价 `/spread`**：每股可成交溢价（红＝比美股贵、绿＝折价）、冲击成本、实际询价路由，附"为什么不能用数据端点的链上价减参考价"的口径说明
 - **程序化接口**：`/api/backtest.json`、`/api/regime.json`（静态产出）
 
-数据管道：GitHub Actions 每交易日同步股价/财报日 → CSV 入库 → 回测与执行器读写 Postgres → 前端构建时渲染；
-溢价快照需 API key，由 `npm run spread` 手动/定时采集（未挂 CI）。
+数据管道由 CI 驱动，不依赖有人手动敲命令——这是"永不停歇"成立的前提：
+
+- `sync-data.yml` 每交易日 UTC 00:30 同步股价与财报日，提交 CSV
+- `run-agent.yml` 每交易日 UTC 01:30 跑执行器（paper）与回测写库，再提交一个时间戳触发站点重建
+- 溢价快照**不能进托管 CI**：币安 Web3 API 对 GitHub runner 出口 IP 返回 `40304` 合规拦截
+  （本机同一份 key 正常），故由本机计划任务跑 `scripts/capture-premium.ps1`
+
+两处外部网络约束（配置时踩到的，尚未整理进 DX-LOG）：Supabase 直连主机
+`db.<ref>.supabase.co` 只有 AAAA 记录，runner 无 IPv6 路由，CI 须改用 Session pooler 串；
+构建产物是静态的，所以写库之后必须有一次 push 才会刷新页面。
 
 ## 对齐评审标准
 
