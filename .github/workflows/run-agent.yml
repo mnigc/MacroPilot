@@ -1,0 +1,62 @@
+name: run-agent
+
+# 让"永不停歇"这句话成立：执行器与溢价采集由 CI 每天驱动，不依赖有人手动敲命令。
+# 排在 sync-data（UTC 00:30 推价格）之后一小时，保证决策看到的是当日收盘价。
+# 只有 spread 一步需要币安 API key，且它全程只读（询价，不签名、不广播）。
+on:
+  schedule:
+    - cron: "30 1 * * 2-6" # 周二到周六 UTC，对应美股收盘后的次日凌晨
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # 探针：币安 Web3 API 对 GitHub runner 的出口 IP 是否放行。
+      # 这一步失败不影响后面的决策与回测，故 continue-on-error。
+      - name: 采集链上可成交溢价
+        continue-on-error: true
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_SECRET_KEY: ${{ secrets.BINANCE_SECRET_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: npm run spread
+
+      - name: 执行器跑一轮（paper）
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EXECUTION_MODE: paper
+        run: npm run agent
+
+      - name: 重跑回测
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: npm run backtest
+
+      # 站点是构建期读库的静态产物，写库不会自己刷新页面；落一个时间戳文件并 push，
+      # 由那次 push 触发 Cloudflare 重建。web/public/ 会被 Astro 原样拷进产物，
+      # 所以 https://…/last-run.txt 就是线上数据的真实新鲜度凭据。
+      - name: 记录运行时间并触发站点重建
+        run: |
+          mkdir -p web/public
+          date -u +%Y-%m-%dT%H:%M:%SZ > web/public/last-run.txt
+          git config user.name "agent-bot"
+          git config user.email "mnigc@users.noreply.github.com"
+          git add web/public/last-run.txt
+          git diff --cached --quiet && { echo "无变化，跳过"; exit 0; }
+          git commit -m "chore: agent run $(date -u +%F)"
+          # 与 sync-data 的提交可能撞车，rebase 后再推
+          git pull --rebase origin main
+          git push origin HEAD:main
