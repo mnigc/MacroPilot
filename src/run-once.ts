@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import type { Address, Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { runOnce, type ExecutorConfig } from "./exec/executor.js";
+import { earningsCalendarStatus } from "./db/index.js";
 import type { RegimeConfig } from "./strategy/regime.js";
 import { splitDrivers } from "./strategy/drivers.js";
 
@@ -118,19 +119,47 @@ console.log(
 console.log(
   `信号分量: liquidity=${summary.regime.signals.liquidity.toFixed(2)} volatility=${summary.regime.signals.volatility.toFixed(2)} rates=${summary.regime.signals.rates.toFixed(2)} trend=${summary.regime.signals.trend.toFixed(2)}`,
 );
+if (cfg.earnings.enabled) {
+  const cal = await earningsCalendarStatus(cfg.tickers);
+  if (cal.rows === 0)
+    console.warn(
+      "⚠ 财报日历为空（earnings_dates 0 行）：财报引擎不会触发。跑 python scripts/sync-prices.py --earnings-only，或由 sync-data workflow 同步。",
+    );
+  else if (cal.upcoming === 0)
+    console.warn(`⚠ 财报日历 ${cal.rows} 行但最新日期 ${cal.latest} 已过期：引擎会恒判"无临近财报"，需要重新同步。`);
+}
 if (summary.earningsAffected.length) console.log(`⚠ 财报引擎生效: ${summary.earningsAffected.join(", ")} 临近财报，权重已缩放`);
 console.log(`组合净值: $${summary.equityBefore.toFixed(2)} → $${summary.equityAfter.toFixed(2)}`);
 console.log(`目标权重: ${Object.entries(summary.targetWeights).map(([t, w]) => `${t}=${(w * 100).toFixed(1)}%`).join(" ")}`);
+console.log(
+  summary.premiumAsOf
+    ? `链上溢价: 快照 ${summary.premiumAsOf.slice(0, 16)}Z · ${
+        [...summary.premiums].map(([t, p]) => `${t}=${(p * 100).toFixed(3)}%`).join(" ") || "无匹配标的"
+      }`
+    : "链上溢价: 48 小时内无快照，本轮退回参考价（采集跑在本机，需 npm run spread 或计划任务）",
+);
 if (summary.trades.length === 0) {
   console.log("本轮无需调仓（漂移在阈值内，且非定投日）");
 } else {
   console.log(`成交 ${summary.trades.length} 笔（逐笔标注全部触发引擎）:`);
+  let friction = 0;
   for (const t of summary.trades) {
     const drivers = splitDrivers(t.drivers.join(","))
       .map((d) => ({ seed: "初始建仓", dca: "定投", regime: "体制", drift: "漂移", earnings: "财报" })[d])
       .join("+");
+    // 买入为正 = 比参考价多付；卖出为负 = 比参考价多收。合计才是本轮真实摩擦。
+    if (t.premium !== null) friction += Math.sign(t.unitsDelta) * ((t.notionalUsdt * t.premium) / (1 + t.premium));
     console.log(
-      `  [${drivers}] ${t.ticker} ${t.unitsDelta >= 0 ? "买入" : "卖出"} ${Math.abs(t.unitsDelta).toFixed(6)} 股，$${t.notionalUsdt.toFixed(2)}${t.txHash ? ` tx=${t.txHash.slice(0, 14)}…` : ""}`,
+      `  [${drivers}] ${t.ticker} ${t.unitsDelta >= 0 ? "买入" : "卖出"} ${Math.abs(t.unitsDelta).toFixed(6)} 股，$${t.notionalUsdt.toFixed(2)}${
+        t.premium !== null ? ` @溢价${(t.premium * 100).toFixed(3)}%` : ""
+      }${t.txHash ? ` tx=${t.txHash.slice(0, 14)}…` : ""}`,
     );
   }
+  if (friction !== 0)
+    console.log(
+      `链上溢价成本: $${friction.toFixed(2)}（${friction > 0 ? "比按参考价成交多付" : "比按参考价成交多收"}，占本轮成交额 ${(
+        (friction / summary.trades.reduce((a, t) => a + t.notionalUsdt, 0)) *
+        100
+      ).toFixed(3)}%）`,
+    );
 }

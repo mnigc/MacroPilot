@@ -10,7 +10,7 @@ import { fetchMacroBundle, MACRO_SERIES } from "../src/data/fred.js";
 import { computeRegimeTimeline, type RegimeConfig } from "../src/strategy/regime.js";
 import { runBacktest } from "../src/backtest/engine.js";
 import { computeMetrics } from "../src/backtest/metrics.js";
-import { parseFredCsv } from "../src/data/stats.js";
+import { parsePriceCsv } from "../src/data/stats.js";
 import { getPool, initSchema, loadPricesFromDb, saveBacktestRun, saveRegimePoints, saveTrades, upsertPrices } from "../src/db/index.js";
 
 function loadStrategyConfig() {
@@ -66,7 +66,7 @@ async function loadPrices(tickers: string[]): Promise<{ prices: Map<string, { da
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".csv")) continue;
       const ticker = f.replace(".csv", "").toUpperCase();
-      const points = parseFredCsv(readFileSync(`${dir}/${f}`, "utf8")); // 同为 date,value 格式
+      const points = parsePriceCsv(readFileSync(`${dir}/${f}`, "utf8")); // date,open,high,low,close（旧格式 date,value 也认）
       if (points.length) prices.set(ticker, points);
     }
   }

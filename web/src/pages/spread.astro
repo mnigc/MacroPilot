@@ -1,78 +1,367 @@
 ---
 import Base from "../layouts/Base.astro";
-import { getLatestPremiums } from "../lib/db";
+import { getLatestPremiums, getLatestTicks, getPremiumHistory } from "../lib/db";
+import { PremiumHistoryChart, TickChart } from "../components/charts";
+import { readFileSync } from "node:fs";
+
+const cfg = (JSON.parse(readFileSync("../config/strategy.json", "utf8")) as {
+  basket: { tickers: string[] };
+  execution: { maxPriceImpactPercent: number; slippagePercent: number; minTradeUsdt: number };
+  engines: { dca: { amountUsdt: number } };
+});
+const guard = cfg.execution;
+const dcaUsdt = cfg.engines.dca.amountUsdt;
+const basket = cfg.basket.tickers;
 
 const snap = await getLatestPremiums();
 const rows = snap?.rows ?? [];
 const pct = (v: number | null, digits = 3) => (v === null || v === undefined ? "—" : `${(v * 100).toFixed(digits)}%`);
 const maxAbs = Math.max(0.001, ...rows.map((r) => Math.abs(r.premium ?? 0)));
 const capturedLabel = snap ? new Date(snap.capturedAt).toISOString().replace("T", " ").slice(0, 19) + " UTC" : "—";
+
+const premiums = rows.map((r) => r.premium).filter((v): v is number => v !== null);
+const avg = premiums.length ? premiums.reduce((a, b) => a + b, 0) / premiums.length : 0;
+const hi = rows.find((r) => (r.premium ?? 0) === Math.max(...premiums, -Infinity));
+const lo = rows.find((r) => (r.premium ?? 0) === Math.min(...premiums, Infinity));
+const blocked = rows.filter((r) => (r.impact_pct ?? 0) > guard.maxPriceImpactPercent);
+
+/**
+ * 日线口径的一年历史。与上面那张"当前溢价"表是两条独立证据：
+ * 询价口径能成交但只有当下，日线口径能回溯但没有盘口 —— 所以分开放，不做同一行的加减。
+ */
+const hist = await getPremiumHistory(basket, 400);
+const sorted = (a: number[]) => [...a].sort((x, y) => x - y);
+const median = (a: number[]) => (a.length ? a[Math.floor(a.length / 2)] ?? 0 : 0);
+const histStats = basket
+  .map((t) => {
+    const rs = hist.filter((r) => r.ticker === t);
+    const vals = sorted(rs.map((r) => r.premium));
+    const last = rs[rs.length - 1];
+    if (!last) return null;
+    return {
+      ticker: t,
+      days: rs.length,
+      from: rs[0]?.date ?? "—",
+      to: last.date,
+      med: median(vals),
+      latest: last.premium,
+      lo: vals[0] ?? 0,
+      hi: vals[vals.length - 1] ?? 0,
+      /** 当前值在自家一年样本里的分位 —— 只有 3 年样本时才叫"历史百分位"，这里如实写"近一年" */
+      rank: vals.length ? (vals.filter((v) => v <= last.premium).length / vals.length) * 100 : 0,
+    };
+  })
+  .filter((s): s is NonNullable<typeof s> => s !== null);
+const histSeries = histStats.map((s) => ({
+  ticker: s.ticker,
+  points: hist.filter((r) => r.ticker === s.ticker).map((r) => ({ date: r.date, premium: r.premium })),
+}));
+const posDays = hist.filter((r) => r.premium > 0).length;
+const posShare = hist.length ? (posDays / hist.length) * 100 : 0;
+const histLo = hist.length ? Math.min(...hist.map((r) => r.premium)) : 0;
+const histHi = hist.length ? Math.max(...hist.map((r) => r.premium)) : 0;
+const histDates = [...new Set(hist.map((r) => r.date))].sort();
+const histSpan = histDates.length ? `${histDates[0]} → ${histDates[histDates.length - 1]}` : "—";
+
+/**
+ * 分钟蜡烛：库里唯一 volume 非零的一路。源站固定返回最近 300 根、且只含**有成交的分钟**，
+ * 所以"这 300 根覆盖了多长时间"本身就是流动性读数。
+ */
+const tickRows = await getLatestTicks();
+const tickBars: Record<string, { t: number; o: number; h: number; l: number; c: number; v: number }[]> = {};
+const tickStats: { ticker: string; n: number; span: string; idle: number; idlePct: number; vol: number; capturedAt: string }[] = [];
+for (const r of tickRows) {
+  const k = r.ticker;
+  const at = (v: number) => v / (r.shareRatio || 1);
+  (tickBars[k] ??= []).push({ t: r.openTime, o: at(r.open), h: at(r.high), l: at(r.low), c: at(r.close), v: r.volume });
+}
+for (const [t, bars] of Object.entries(tickBars)) {
+  const first = bars[0];
+  const last = bars[bars.length - 1];
+  if (!first || !last) continue;
+  const spanMin = Math.round((last.t - first.t) / 60000) + 1;
+  const idle = Math.max(0, spanMin - bars.length);
+  tickStats.push({
+    ticker: t,
+    n: bars.length,
+    span: spanMin >= 2880 ? `${(spanMin / 1440).toFixed(1)} 天` : `${(spanMin / 60).toFixed(1)} 小时`,
+    idle,
+    idlePct: (idle / spanMin) * 100,
+    vol: bars.reduce((a, b) => a + b.v, 0),
+    capturedAt: tickRows.find((r) => r.ticker === t)?.capturedAt ?? "—",
+  });
+}
+tickStats.sort((a, b) => a.idlePct - b.idlePct);
+const tickOrder = tickStats.map((s) => s.ticker);
+const missingTicks = basket.filter((t) => !tickBars[t]?.length);
+const capturedTick = tickStats[0]?.capturedAt ?? "—";
+
+/** live 执行器的下单前置：冲击成本超阈值直接拒单，宁可不买也不付超额滑点 */
+const guardOf = (r: (typeof rows)[number]) => {
+  if (r.impact_pct === null || r.impact_pct === undefined) return { cls: "chip", label: "无询价" };
+  return r.impact_pct > guard.maxPriceImpactPercent
+    ? { cls: "chip bad", label: `拒单 ${r.impact_pct.toFixed(2)}%` }
+    : { cls: "chip ok", label: `可成交 ${r.impact_pct.toFixed(2)}%` };
+};
 ---
-<Base active="spread">
-  <div class="hero reveal" style="padding-bottom:0">
-    <h1>链上<span class="grad">溢价监控</span></h1>
-    <p>同一股英伟达，链上代币比美股官方价贵多少？这个差价是代币化股票独有的实时情绪信号</p>
+<Base active="spread" crumb="链上溢价" sub="同一股英伟达：链上可成交价 vs 美股官方参考价 —— 代币化股票独有的实时情绪信号">
+  <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
+    <span class="chip">快照 {snap?.snapshots ?? 0} 轮</span>
+    <span class="chip">采集 {capturedLabel}</span>
   </div>
 
-  <div class="card reveal d1 accent-top" style="margin-top:22px; border-color: rgba(240,185,11,0.22)">
-    <h3 style="color: var(--accent)">◆ 口径说明：为什么不能直接拿"链上价"减"参考价"</h3>
-    <p class="text">
-      RWA 数据端点确实同时返回 <code>tokenPrice</code> 与 <code>referencePrice</code>，但实测（2026-09-26，Mag7 全部命中）
-      存在恒等式 <b>tokenPrice ≡ referencePrice × tokenToShareRatio</b> —— 前者是发行方的<b>净值标记</b>，不含盘口，
-      拿它减参考价得到的价差恒等于份额比，7 只标的的"每股溢价"全部精确为 0.000%。
-    </p>
-    <p class="text">
-      真正的链上价格只能问<b>聚合器询价</b>：用固定 50 USDT 买入该代币，用报价的付出/到手数量反推可成交单价，
-      再按 <code>tokenToShareRatio</code> 折算到"每股"口径，与官方参考价比 —— 下面这张表的数就是这么来的。
-      溢价走高＝链上抢筹，走低甚至转负＝链上折价，是定投引擎可以用的加仓时机信号。
-    </p>
-    <div class="faint">快照 {snap?.snapshots ?? 0} 轮 · 最近采集 {capturedLabel} · 采集方式 <code>npm run spread</code>（只询价，不签名不广播）</div>
+  <div class="tiles">
+    <div class="tile">
+      <div class="tile-k">篮子平均溢价</div>
+      <div class:list={["tile-v", "sm", avg >= 0 ? "down" : "up"]}>{pct(avg)}</div>
+      <div class="tile-s">正＝链上比美股贵（追高成本）</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">最高溢价</div>
+      <div class:list={["tile-v", "sm", (hi?.premium ?? 0) >= 0 ? "down" : "up"]}>{hi ? `${hi.ticker} ${pct(hi.premium)}` : "—"}</div>
+      <div class="tile-s">{hi?.symbol ?? "—"}</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">最低 / 折价</div>
+      <div class:list={["tile-v", "sm", (lo?.premium ?? 0) >= 0 ? "down" : "up"]}>{lo ? `${lo.ticker} ${pct(lo.premium)}` : "—"}</div>
+      <div class="tile-s">转负＝链上折价，定投可优先加仓</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">冲击成本守卫</div>
+      <div class="tile-v sm">{guard.maxPriceImpactPercent}%</div>
+      <div class="tile-s">超过即拒单 · 当前拦下 <b class="down">{blocked.length}</b> 只</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">询价方式</div>
+      <div class="tile-v sm">50 USDT</div>
+      <div class="tile-s">只询价，不签名不广播</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">近一年链上更贵的天数</div>
+      <div class:list={["tile-v", "sm", posShare >= 50 ? "down" : "up"]}>{posShare.toFixed(0)}%</div>
+      <div class="tile-s">日线口径 · {posDays}/{hist.length} 个同日样本</div>
+    </div>
   </div>
 
-  <div class="section-title reveal d2">当前溢价 · 每股口径</div>
-  <div class="card reveal d2">
-    {rows.map((r) => {
-      const p = r.premium ?? 0;
-      const w = (Math.abs(p) / maxAbs) * 100;
-      const color = p >= 0 ? "#f6465d" : "#2ebd85";
-      return (
-        <div class="signal-row">
-          <span class="name" style="width:110px">{r.ticker}<span class="faint" style="font-weight:400"> · {r.symbol}</span></span>
-          <div class="bar"><div class="fill" style={`--w: ${w}%; background: linear-gradient(90deg, ${color}55, ${color}); box-shadow: 0 0 10px ${color}44;`}></div></div>
-          <span class="num" style={`color: ${color}`}>{pct(r.premium)}</span>
+  <div class="grid g-21" style="margin-top:12px">
+    <div class="panel">
+      <div class="panel-hd"><h2>当前溢价 · 每股口径</h2><span class="hint">刻度按本轮最大绝对值归一</span></div>
+      <div class="panel-bd">
+        {rows.map((r) => {
+          const p = r.premium ?? 0;
+          const g = guardOf(r);
+          return (
+            <div class="sig" style="grid-template-columns:96px 1fr 72px 92px">
+              <div class="n">{r.ticker}<em>{r.symbol} · {r.platform}</em></div>
+              <div class="bar lg"><i style={`width:${(Math.abs(p) / maxAbs) * 100}%;background:var(--${p >= 0 ? "down" : "up"})`}></i></div>
+              <div class:list={["v", p >= 0 ? "down" : "up"]}>{pct(p)}</div>
+              <div class="raw"><b class={g.cls === "chip bad" ? "down" : g.cls === "chip ok" ? "up" : ""}>{g.label}</b>守卫 {guard.maxPriceImpactPercent}%</div>
+            </div>
+          );
+        })}
+        {rows.length === 0 && <div class="empty">暂无快照 —— 配置 <code>.env</code> 后运行 <code>npm run spread</code></div>}
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="note">
+        <span class="ic">◇</span>
+        <div>
+          溢价走高＝链上抢筹，走低甚至转负＝链上折价。定投引擎每周固定买入 {dcaUsdt} USDT，
+          <b>把"买哪只"的倾斜交给溢价读数</b>，是这条数据链唯一真正影响成交的地方。
         </div>
-      );
-    })}
-    {rows.length === 0 && <div class="faint">暂无快照 —— 配置 .env 后运行 <code>npm run spread</code></div>}
-    <div class="faint" style="margin-top:10px">红＝链上比美股贵（追高成本），绿＝链上折价（相对便宜）。刻度按本轮最大绝对值归一。</div>
+      </div>
+      <div class:list={[blocked.length ? "note warn" : "note"]}>
+        <span class="ic">{blocked.length ? "⚠" : "✓"}</span>
+        <div>
+          {blocked.length ? (
+            <>本轮有 <b>{blocked.length}</b> 只标的的询价冲击成本超过 <code>{guard.maxPriceImpactPercent}%</code> 守卫
+              （{blocked.map((b) => `${b.ticker} ${b.impact_pct?.toFixed(2)}%`).join(" · ")}）。
+              live 模式下执行器会对这些标的<b>直接拒单</b>，而不是硬吃滑点 —— 纸面账户照成交、真实账户不成交，这个差异必须被看见。</>
+          ) : (
+            <>本轮 {rows.length} 只标的的询价冲击成本全部低于 <code>{guard.maxPriceImpactPercent}%</code> 守卫，live 模式下都会放行。
+              守卫拦下的那一类（盘口太薄）在纸面账户里是<b>看不出来的</b> —— 这正是溢价采集必须独立跑的原因。</>
+          )}
+        </div>
+      </div>
+    </div>
   </div>
 
-  <div class="section-title reveal d3">明细 · 三种价格并排</div>
-  <div class="card reveal d3">
-    <table>
-      <thead>
-        <tr><th>标的</th><th>代币</th><th>发行平台</th><th>官方参考价</th><th>净值标记</th><th>可成交单价</th><th>溢价</th><th>冲击成本</th><th>询价路由</th></tr>
-      </thead>
-      <tbody>
-        {rows.map((r) => (
-          <tr>
-            <td>{r.ticker}</td>
-            <td class="text">{r.symbol}</td>
-            <td class="text">{r.platform}</td>
-            <td>{r.reference_price?.toFixed(3) ?? "—"}</td>
-            <td class="faint">{r.mark_price?.toFixed(3) ?? "—"}</td>
-            <td>{r.executable_price?.toFixed(3) ?? "—"}</td>
-            <td class={(r.premium ?? 0) >= 0 ? "down" : "up"}>{pct(r.premium)}</td>
-            <td>{r.impact_pct === null ? "—" : `${r.impact_pct.toFixed(3)}%`}</td>
-            <td class="text faint">{[r.vendor, r.dex].filter(Boolean).join(" / ") || "—"}</td>
-          </tr>
-        ))}
-        {rows.length === 0 && <tr><td colspan="9" class="text faint">暂无记录</td></tr>}
-      </tbody>
-    </table>
-    <div class="faint" style="margin-top:10px">
-      "净值标记"列刻意保留：它与参考价之间没有信息量（差值＝份额比），放在这里是作为反面教材 ——
-      接一个数据源之前，先验证它的两个字段是不是同一个数的两种写法。
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd">
+      <h2>溢价历史 · 日线口径</h2>
+      <span class="hint">链上 1d 收盘 ÷ 份额比 vs 美股同日收盘 —— 能回溯一年，但没有盘口</span>
+      <div class="right"><span class="faint mono">{hist.length} 个同日样本 · {histSpan}</span></div>
+    </div>
+    <div class="panel-bd">
+      {
+        histSeries.length ? (
+          <PremiumHistoryChart client:load series={histSeries} />
+        ) : (
+          <div class="empty">
+            暂无链上日线 —— 本机计划任务跑 <code>npm run candles</code> 开始积累（首次一次性回填约一年）
+          </div>
+        )
+      }
+      <div class="klegend">
+        <span class="faint">纵轴＝链上每股价相对美股收盘高出多少，虚线是平价线（0%）</span>
+        <span class="faint">· 上方＝链上抢筹，下方＝链上折价 · 底部滑块可看满一年</span>
+      </div>
+
+      <div class="sep"></div>
+
+      <div style="overflow-x:auto">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th class="l">标的</th>
+              <th>样本天数</th>
+              <th>覆盖起点</th>
+              <th>中位溢价</th>
+              <th>最新（同日口径）</th>
+              <th>近一年分位</th>
+              <th>区间</th>
+            </tr>
+          </thead>
+          <tbody>
+            {histStats.map((s) => (
+              <tr>
+                <td class="l t"><b>{s.ticker}</b></td>
+                <td>{s.days}</td>
+                <td class="dim">{s.from}</td>
+                <td class={s.med >= 0 ? "down" : "up"}>{pct(s.med)}</td>
+                <td class={s.latest >= 0 ? "down" : "up"}>{pct(s.latest)}</td>
+                <td>
+                  <span class="faint">{s.rank.toFixed(0)}%</span>
+                  <i class="rank"><b style={`width:${s.rank}%`}></b></i>
+                </td>
+                <td class="faint">{pct(s.lo, 2)} ~ {pct(s.hi, 2)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note warn" style="margin-top:12px">
+        <span class="ic">⚠</span>
+        <div>
+          <b>这条线与上面那张表不能互相加减。</b>它是"链上 UTC 自然日收盘 vs 美股同日收盘"，两边收盘时刻本就差几小时；
+          区间两端的极端值（最负 {pct(histLo, 1)}、最正 {pct(histHi, 1)}）多数是这种错位在剧烈波动日被放大的结果，
+          而不是真有人按那个价成交。要看<b>此刻真能不能成交、付多少滑点</b>，只有聚合器询价那一条算数。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd">
+      <h2>分钟蜡烛 · 唯一带成交量的源</h2>
+      <span class="hint">签名 /dex/market/candles：1 分钟 bar，源站只返回有成交的分钟</span>
+      <div class="right"><span class="faint mono">采集 {capturedTick} UTC</span></div>
+    </div>
+    <div class="panel-bd">
+      {
+        tickOrder.length ? (
+          <TickChart client:load bars={tickBars} order={tickOrder} />
+        ) : (
+          <div class="empty">暂无分钟蜡烛 —— 运行 <code>npm run candles</code> 采集</div>
+        )
+      }
+      <div class="klegend">
+        <span class="faint">左轴＝链上每股价（代币价 ÷ 份额比），右轴＝源站 volume 原值</span>
+        <span class="faint">· 时间均为 UTC · 下拉换标的</span>
+      </div>
+      <div class="sep"></div>
+      <div style="overflow-x:auto">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th class="l">标的</th>
+              <th>根数</th>
+              <th>300 根覆盖了</th>
+              <th>无成交分钟</th>
+              <th>volume 合计（源站口径）</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tickStats.map((s) => (
+              <tr>
+                <td class="l t"><b>{s.ticker}</b></td>
+                <td>{s.n}</td>
+                <td class={s.idlePct > 60 ? "down" : "up"}>{s.span}</td>
+                <td>{s.idlePct.toFixed(0)}%</td>
+                <td class="faint">{s.vol.toFixed(0)}</td>
+              </tr>
+            ))}
+            {missingTicks.length > 0 && (
+              <tr>
+                <td class="l faint" colspan="5">
+                  {missingTicks.join(" · ")} 本轮无分钟蜡烛 —— 该端点对这些标的返回空，等下一轮采集
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div class="note" style="margin-top:12px">
+        <span class="ic">◇</span>
+        <div>
+          同样都是 300 根，<b>覆盖的真实时间差了几十倍</b>：NVDA 是 5.7 小时，AMZN 要往前翻 18 天才凑够。
+          这一列"300 根覆盖了多久"就是链上活跃度读数，比 volume 那个字段可信 ——
+          源站没写它的单位，按"枚"解读会得到与我们自己询价深度相差三个数量级的名义额，所以这里只照抄原值、不参与任何决策。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd"><h2>明细 · 三种价格并排</h2><span class="hint">收盘参考 / 发行方净值标记 / 聚合器可成交</span></div>
+    <div class="panel-bd flush">
+      <table class="tbl">
+        <thead>
+          <tr><th class="l">标的</th><th class="l">代币</th><th class="l">发行平台</th><th>官方参考价</th><th>净值标记</th><th>可成交单价</th><th>溢价</th><th>冲击成本</th><th class="l">执行守卫</th><th class="l">询价路由</th></tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr>
+              <td class="l t"><b>{r.ticker}</b></td>
+              <td class="l dim">{r.symbol}</td>
+              <td class="l dim">{r.platform}</td>
+              <td>{r.reference_price?.toFixed(3) ?? "—"}</td>
+              <td class="faint">{r.mark_price?.toFixed(3) ?? "—"}</td>
+              <td>{r.executable_price?.toFixed(3) ?? "—"}</td>
+              <td class={r.premium !== null && r.premium >= 0 ? "down" : "up"}>{pct(r.premium)}</td>
+              <td class={(r.impact_pct ?? 0) > guard.maxPriceImpactPercent ? "down strong" : ""}>{r.impact_pct === null ? "—" : `${r.impact_pct.toFixed(3)}%`}</td>
+              <td class="l">{(() => { const g = guardOf(r); return <span class={g.cls}>{g.label}</span>; })()}</td>
+              <td class="l faint">{[r.vendor, r.dex].filter(Boolean).join(" / ") || "—"}</td>
+            </tr>
+          ))}
+          {rows.length === 0 && <tr><td colspan="10" class="empty">暂无记录</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd"><h2>口径说明</h2><span class="hint">为什么不能直接拿"链上价"减"参考价"</span></div>
+    <div class="panel-bd">
+      <p class="faint" style="line-height:1.75">
+        RWA 数据端点确实同时返回 <code class="mono">tokenPrice</code> 与 <code class="mono">referencePrice</code>，但实测（2026-09-26，Mag7 全部命中）
+        存在恒等式 <b>tokenPrice ≡ referencePrice × tokenToShareRatio</b> —— 前者是发行方的<b>净值标记</b>，不含盘口，
+        拿它减参考价得到的价差恒等于份额比，7 只标的的"每股溢价"全部精确为 0.000%。
+      </p>
+      <div class="sep"></div>
+      <p class="faint" style="line-height:1.75">
+        真正的链上价格只能问<b>聚合器询价</b>：用固定 50 USDT 买入该代币，用报价的付出/到手数量反推可成交单价，
+        再按 <code class="mono">tokenToShareRatio</code> 折算到"每股"口径，与官方参考价比 —— 上面这张表的数就是这么来的。
+      </p>
+      <div class="note" style="margin-top:12px">
+        <span class="ic">▣</span>
+        <div>
+          "净值标记"一列刻意保留，作为反面教材：它与参考价之间没有信息量（差值＝份额比）。
+          <b>接一个数据源之前，先验证它的两个字段是不是同一个数的两种写法。</b>
+        </div>
+      </div>
     </div>
   </div>
 </Base>

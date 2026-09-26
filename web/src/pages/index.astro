@@ -1,6 +1,6 @@
 ---
 import Base from "../layouts/Base.astro";
-import { ScoreChart, SignalChart, EquityChart } from "../components/charts";
+import { ScoreChart, EquityChart } from "../components/charts";
 import { regimeBands, REGIME_LABEL } from "../lib/bands";
 import { DRIVER_LABEL, parseDrivers } from "../lib/drivers";
 import {
@@ -8,207 +8,394 @@ import {
   getRegimePoints,
   getTrades,
   getPortfolio,
-  getLatestPrices,
-  getUpcomingEarnings,
+  getTickerBoard,
+  getEarningsCoverage,
+  getNextEarnings,
+  getMacroReadings,
+  getPremiumFriction,
 } from "../lib/db";
+import { readFileSync } from "node:fs";
+
+const cfg = JSON.parse(readFileSync("../config/strategy.json", "utf8")) as {
+  engines: {
+    dca: { amountUsdt: number };
+    regime: { scoreHigh: number; scoreLow: number; scoreRelease: number; allocation: Record<string, number>; signals: Record<string, { weight: number }> };
+    drift: { thresholdPp: number };
+    earnings: { riskOffDaysBefore: number; scaleFactor: number; restoreDaysAfter: number };
+  };
+  execution: { mode: string; startCashUsdt: number };
+};
 
 const run = await getLatestRun();
+const tickers: string[] = run?.tickers ?? [];
 const regimePoints = run ? await getRegimePoints(run.id) : [];
 const latest = regimePoints.at(-1) ?? null;
 const bands = regimeBands(regimePoints.map((p) => p.date), regimePoints.map((p) => p.regime));
 
-const paperTrades = await getTrades("paper", 8);
-const portfolio = await getPortfolio("paper");
-const tickers = run?.tickers ?? [];
-const prices = await getLatestPrices(tickers);
-const earnings = await getUpcomingEarnings(tickers);
+const [board, portfolio, paperTrades, cover, nextEarn, macro, friction] = await Promise.all([
+  getTickerBoard(tickers),
+  getPortfolio("paper"),
+  getTrades("paper", 200),
+  getEarningsCoverage(tickers),
+  getNextEarnings(tickers),
+  getMacroReadings(),
+  getPremiumFriction("paper"),
+]);
 
+const px = Object.fromEntries(board.map((b) => [b.ticker, b]));
 const cash = portfolio.find((p) => p.ticker === "CASH")?.units ?? 0;
-const positions = portfolio.filter((p) => p.ticker !== "CASH");
-const equity = cash + positions.reduce((acc, p) => acc + p.units * (prices[p.ticker] ?? 0), 0);
-const startCash = (run?.params as { startCashUsdt?: number } | null)?.startCashUsdt ?? 10_000;
-const pnlPct = equity > 0 ? equity / startCash - 1 : 0;
+const holdings = portfolio.filter((p) => p.ticker !== "CASH");
+const equity = cash + holdings.reduce((a, p) => a + p.units * (px[p.ticker]?.close ?? 0), 0);
+const startCash = cfg.execution.startCashUsdt;
+const pnl = equity > 0 ? equity / startCash - 1 : 0;
+const cashWeight = equity > 0 ? cash / equity : 0;
+const cashTarget = latest ? 1 - latest.equity_target : 0;
 
-const dcaAmount = (run?.params as { dcaUsdt?: number } | null)?.dcaUsdt ?? 50;
+const e = cfg.engines;
+const targetEach = latest ? latest.equity_target / (tickers.length || 1) : 0;
+/** 财报窗口内的标的：前 riskOffDaysBefore 天 ~ 后 restoreDaysAfter 天，目标权重减半 */
+const earnWindow = new Map(nextEarn.map((n) => [n.ticker, n]));
+const inWindow = (t: string) => {
+  const n = earnWindow.get(t);
+  return !!n && n.daysAway <= e.earnings.riskOffDaysBefore && n.daysAway >= -e.earnings.restoreDaysAfter;
+};
+const targetOf = (t: string) => targetEach * (inWindow(t) ? e.earnings.scaleFactor : 1);
+
+const rows = holdings
+  .map((p) => {
+    const b = px[p.ticker];
+    const value = p.units * (b?.close ?? 0);
+    const weight = equity > 0 ? value / equity : 0;
+    const tgt = targetOf(p.ticker);
+    return { ticker: p.ticker, units: p.units, close: b?.close ?? 0, value, weight, tgt, drift: (weight - tgt) * 100, b };
+  })
+  .sort((a, b) => b.value - a.value);
+const maxDrift = rows.reduce((m, r) => Math.max(m, Math.abs(r.drift)), 0);
+const drifted = rows.filter((r) => Math.abs(r.drift) > e.drift.thresholdPp).length;
+
+const prem = board.map((b) => b.premium).filter((v): v is number => v !== null);const avgPremium = prem.length ? prem.reduce((a, b) => a + b, 0) / prem.length : null;
+const nextEarnLabel = nextEarn[0] ? `${nextEarn[0].ticker} T-${nextEarn[0].daysAway}` : "—";
+
 const nextFriday = (() => {
   const now = new Date();
   const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-  const add = (5 - d.getUTCDay() + 7) % 7 || 7;
-  d.setUTCDate(d.getUTCDate() + add);
+  d.setUTCDate(d.getUTCDate() + ((5 - d.getUTCDay() + 7) % 7 || 7));
   return d.toISOString().slice(0, 10);
 })();
+const dcaCount = paperTrades.filter((t) => parseDrivers(t.reason).includes("dca")).length;
 
-const recent = regimePoints.slice(-180);
-const weights = positions
-  .map((p) => ({ ticker: p.ticker, weight: equity > 0 ? (p.units * (prices[p.ticker] ?? 0)) / equity : 0 }))
-  .sort((a, b) => b.weight - a.weight);
-const target = latest ? latest.equity_target / (tickers.length || 1) : 0;
+/** 综合分到最近一次切换的边沿距离——"引擎现在离动作有多远" */
+const score = latest?.score ?? 0;
+const regime = latest?.regime ?? "neutral";
+/** 距下一次体制切换的"余量"：极态看回落内沿，中性看最近的外沿。正数=还有距离 */
+const edge = (() => {
+  if (regime === "riskOn") return { label: "距跌回中性", v: score - e.regime.scoreRelease };
+  if (regime === "riskOff") return { label: "距爬回中性", v: e.regime.scoreRelease - score };
+  const up = e.regime.scoreHigh - score;
+  const down = score - e.regime.scoreLow;
+  return up <= down ? { label: "距 risk-on", v: up } : { label: "距 risk-off", v: down };
+})();
+const switches90 = (() => {
+  const cut = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
+  let n = 0;
+  for (let i = 1; i < regimePoints.length; i++) {
+    if (regimePoints[i].date < cut) continue;
+    if (regimePoints[i].regime !== regimePoints[i - 1].regime) n++;
+  }
+  return n;
+})();
 
-const signalList = latest ? (Object.entries(latest.signals) as [string, number][]) : [];
-const signalColor = (v: number) => (v >= 0.6 ? "#2ebd85" : v <= 0.4 ? "#f6465d" : "#f0b90b");
-const signalName = (k: string) =>
-  k === "liquidity" ? "流动性" : k === "volatility" ? "波动率" : k === "rates" ? "利率" : "趋势";
+const sigMeta = [
+  { key: "liquidity", name: "流动性", series: "WALCL", w: e.regime.signals.liquidity.weight, desc: "联储资产负债表规模 13 周变化（扩表加分）", fmt: (v: number) => `${(v / 1000).toFixed(0)} 十亿$` },
+  { key: "volatility", name: "波动率", series: "VIXCLS", w: e.regime.signals.volatility.weight, desc: "VIX 水平 70% + 1 月趋势 30%（低波动加分）", fmt: (v: number) => v.toFixed(2) },
+  { key: "rates", name: "利率", series: "DGS10", w: e.regime.signals.rates.weight, desc: "10Y 收益率 13 周变化（下行加分）", fmt: (v: number) => `${v.toFixed(2)}%` },
+  { key: "trend", name: "趋势", series: "SP500", w: e.regime.signals.trend.weight, desc: "标普 500 相对 200 日均线的位置", fmt: (v: number) => v.toFixed(0) },
+] as const;
 
 const fmtUsd = (v: number) => `$${v.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
-const fmtPct = (v: number) => `${(v * 100).toFixed(1)}%`;
+const fmtPct = (v: number, d = 1) => `${(v * 100).toFixed(d)}%`;
+const sigColor = (v: number) => (v >= 0.6 ? "up" : v <= 0.4 ? "down" : "yel");
+const sigValues: Record<string, number> = latest ? { ...latest.signals } : {};
 
-const engines = [
+/** 状态行里的数字加粗：string 是说明文字，{b} 是读数 */
+type Tok = string | { b: string; cls?: string };
+
+const engines: { cls: string; name: string; rule: string; icon: string; state: Tok[] }[] = [
   {
-    name: "定投引擎",
-    cls: "yellow",
-    desc: `每周五自动买入 ${fmtUsd(dcaAmount)}，按目标权重分配到篮子`,
-    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>',
+    cls: "y", name: "定投引擎", rule: `每周五 13:00 UTC 注入 ${fmtUsd(e.dca.amountUsdt)}，按当期目标权重买入`,
+    icon: '<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>',
+    state: ["下次 ", { b: nextFriday }, " · 已执行 ", { b: String(dcaCount) }, " 次"],
   },
   {
-    name: "体制引擎",
-    cls: "green",
-    desc: latest ? `当前 ${REGIME_LABEL[latest.regime]}，股票目标仓位 ${fmtPct(latest.equity_target)}` : "—",
-    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 21a9 9 0 1 1 9-9"/><path d="M12 12l4.5-4.5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg>',
+    cls: "g", name: "体制引擎", rule: "四信号百分位加权 → 综合分 → 三态滞回决定总仓位",
+    icon: '<circle cx="12" cy="12" r="9"/><path d="M12 12l4.5-4.5"/><path d="M12 21v-3"/>',
+    state: [`${REGIME_LABEL[regime]} `, { b: `${((latest?.equity_target ?? 0) * 100).toFixed(0)}%` }, ` · ${edge.label} `, { b: edge.v.toFixed(3) }, " · 近 90 天切换 ", { b: String(switches90) }, " 次"],
   },
   {
-    name: "漂移引擎",
-    cls: "purple",
-    desc: "个股权重偏离目标 ±5pp 即触发拉回，抑制磨损",
-    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>',
+    cls: "p", name: "漂移引擎", rule: `任一标的权重偏离目标 ±${e.drift.thresholdPp}pp 即拉回，抑制磨损`,
+    icon: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+    state: ["最大偏离 ", { b: `${maxDrift.toFixed(2)}pp` }, " · 超阈值 ", { b: String(drifted) }, `/${rows.length} 只`],
   },
   {
-    name: "财报引擎",
-    cls: "blue",
-    desc: earnings.length
-      ? `⚠ ${earnings.map((e) => `${e.ticker} ${e.earnings_date}`).join(" · ")} 临近自动减仓`
-      : "未来 60 天篮子内无临近财报",
-    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.7 3.86a2 2 0 0 0-3.4 0z"/></svg>',
+    cls: cover.rows === 0 ? "w" : "b", name: "财报引擎", rule: `财报前 ${e.earnings.riskOffDaysBefore} 天该股权重 ×${e.earnings.scaleFactor}，后 ${e.earnings.restoreDaysAfter} 天恢复`,
+    icon: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h16.9a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
+    state: cover.rows === 0
+      ? [{ b: "⚠ 日历为空", cls: "down" }, "，引擎不会触发"]
+      : ["日历 ", { b: String(cover.rows) }, " 条 · 下一场 ", { b: nextEarn[0]?.ticker ?? "—" }, ` T-${nextEarn[0]?.daysAway ?? "—"} · 窗口内 `, { b: String([...earnWindow.keys()].filter(inWindow).length) }, " 只"],
   },
 ];
 ---
-<Base active="dash">
-  <div class="hero reveal">
-    <h1>宏观驱动的<span class="grad">代币化股票</span>智能投顾</h1>
-    <p>定投 · 体制 · 漂移 · 财报，四引擎共享一个链上执行器 —— 传统券商做不到的 7×24 自动组合管理</p>
-    <div class="statusline">
-      <span class="badge {latest?.regime ?? "neutral"}"><span class="dot"></span>{latest ? REGIME_LABEL[latest.regime] : "—"} · 综合分 {latest ? latest.score.toFixed(3) : "—"}</span>
-      <span class="faint">信号 3 年滚动百分位 · 滞回切换 · 低换手</span>
+<Base active="dash" crumb="投顾仪表盘" sub="四引擎 → 一张目标权重表 → 一个链上执行器">
+  <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
+    <span class:list={["badge", regime]}><span class="dot"></span>{REGIME_LABEL[regime]} · {score.toFixed(3)}</span>
+    <span class="chip">{cfg.execution.mode === "paper" ? "纸面账户" : "真实资金"}</span>
+  </div>
+
+  <div class="tiles">
+    <div class="tile">
+      <div class="tile-k">Paper 组合净值</div>
+      <div class="tile-v">{fmtUsd(equity)}</div>
+      <div class="tile-s"><span class:list={["delta", pnl >= 0 ? "up" : "down"]}>{pnl >= 0 ? "▲" : "▼"} {fmtPct(Math.abs(pnl), 2)}</span> vs 初始 {fmtUsd(startCash)}</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">目标股票仓位</div>
+      <div class="tile-v yel">{((latest?.equity_target ?? 0) * 100).toFixed(0)}%</div>
+      <div class="tile-s">risk-on {(e.regime.allocation.riskOn * 100).toFixed(0)}% / 中性 {(e.regime.allocation.neutral * 100).toFixed(0)}% / 防御 {(e.regime.allocation.riskOff * 100).toFixed(0)}%</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">资金分布 · 股票 / 稳定币</div>
+      <div class="tile-v sm">{fmtUsd(equity - cash)} <span class="faint">/</span> {fmtUsd(cash)}</div>
+      <div class="bar lg" style="margin-top:8px"><i style={`width:${((equity - cash) / (equity || 1)) * 100}%`}></i></div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">下次定投</div>
+      <div class="tile-v sm">{nextFriday}</div>
+      <div class="tile-s">周五注入 {fmtUsd(e.dca.amountUsdt)} · 已执行 {dcaCount} 次</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">最近一场财报</div>
+      <div class="tile-v sm">{nextEarnLabel}</div>
+      <div class="tile-s">{nextEarn[0]?.date ?? "日历未同步"} · 窗口 {e.earnings.riskOffDaysBefore} 天</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">链上平均溢价</div>
+      <div class:list={["tile-v", "sm", avgPremium === null ? "" : avgPremium >= 0 ? "down" : "up"]}>
+        {avgPremium === null ? "—" : `${(avgPremium * 100).toFixed(3)}%`}
+      </div>
+      <div class="tile-s">
+        {friction
+          ? `已按此价成交 ${friction.fills} 笔 · 累计${friction.usd >= 0 ? "多付" : "多收"} ${fmtUsd(Math.abs(friction.usd))}`
+          : "paper 成交尚未叠加溢价"} · <a href="/spread">详情</a>
+      </div>
     </div>
   </div>
 
-  <div class="grid grid-4" style="margin-top: 22px;">
-    <div class="card accent-top metric reveal d1">
-      <div class="label">Paper 组合净值</div>
-      <div class="value grad" data-countup={equity.toFixed(2)} data-prefix="$" data-decimals="2">$0.00</div>
-      <div class="sub"><span class="delta {pnlPct >= 0 ? "up" : "down"}">{pnlPct >= 0 ? "▲" : "▼"} {fmtPct(Math.abs(pnlPct))}</span> vs 初始 {fmtUsd(startCash)}</div>
+  {cover.rows === 0 && (
+    <div class="note bad" style="margin-top:12px">
+      <span class="ic">⚠</span>
+      <div><b>财报日历为空</b>（earnings_dates 0 行）——财报引擎不会触发，任何"无临近财报"的读数都不成立。运行 <code>python scripts/sync-prices.py --earnings-only</code> 或由 sync-data workflow 同步。</div>
     </div>
-    <div class="card metric reveal d2">
-      <div class="label">当前宏观体制</div>
-      <div class="value"><span class="badge {latest?.regime ?? "neutral"}"><span class="dot"></span>{latest ? REGIME_LABEL[latest.regime] : "—"}</span></div>
-      <div class="sub">触发线 0.60 / 0.30 · 区间内保持</div>
-    </div>
-    <div class="card metric reveal d3">
-      <div class="label">目标股票仓位</div>
-      <div class="value accent">{latest ? fmtPct(latest.equity_target) : "—"}</div>
-      <div class="sub">risk-off 时自动降至 25%</div>
-    </div>
-    <div class="card metric reveal d4">
-      <div class="label">下次定投（周五）</div>
-      <div class="value">{nextFriday}</div>
-      <div class="sub">每周自动买入 {fmtUsd(dcaAmount)}</div>
-    </div>
-  </div>
+  )}
 
-  <div class="section-title reveal d4">信号分量 <span class="faint" style="font-weight:400">0 = 最不利 · 1 = 最有利</span></div>
-  <div class="grid grid-2">
-    <div class="card reveal d5">
-      <h3>今日读数</h3>
-      {signalList.map(([key, v]) => (
-        <div class="signal-row">
-          <span class="name">{signalName(key)}</span>
-          <div class="bar"><div class="fill" style={`--w: ${v * 100}%; background: linear-gradient(90deg, ${signalColor(v)}55, ${signalColor(v)}); box-shadow: 0 0 10px ${signalColor(v)}55;`}></div></div>
-          <span class="num" style={`color: ${signalColor(v)}`}>{v.toFixed(2)}</span>
+  <div class="grid g-32" style="margin-top:12px">
+    <div class="panel">
+      <div class="panel-hd">
+        <h2>宏观体制</h2><span class="hint">综合分 = 四信号百分位加权 · 三态滞回</span>
+        <div class="right"><span class="faint">截至 {latest?.date ?? "—"}</span></div>
+      </div>
+      <div class="panel-bd">
+        <div class="gauge">
+          <div class="gauge-score">
+            <span class="big">{score.toFixed(3)}</span>
+            <span class:list={["badge", regime]}><span class="dot"></span>{REGIME_LABEL[regime]}</span>
+            <span class="faint" style="margin-left:auto">{edge.label} <b class="mono">{edge.v.toFixed(3)}</b></span>
+          </div>
+          <div class="gauge-track">
+            <div class="gauge-needle" style={`left:${Math.max(0, Math.min(100, score * 100))}%`}></div>
+          </div>
+          <div class="gauge-scale">
+            <span style="left:0%">0</span>
+            <span style={`left:${e.regime.scoreLow * 100}%`}><b>{e.regime.scoreLow.toFixed(2)}</b>risk-off ≤</span>
+            <span style={`left:${e.regime.scoreRelease * 100}%`}><b>{e.regime.scoreRelease.toFixed(2)}</b>回落内沿</span>
+            <span style={`left:${e.regime.scoreHigh * 100}%`}><b>{e.regime.scoreHigh.toFixed(2)}</b>risk-on ≥</span>
+            <span style="left:97%">1</span>
+          </div>
         </div>
-      ))}
-      <div class="faint" style="margin-top:10px">权重：流动性 30% · 波动率 30% · 利率 20% · 趋势 20%</div>
+        <div class="sep"></div>
+        <div class="faint" style="margin-bottom:6px">近 180 天综合分与体制色带（绿=risk-on · 蓝=中性 · 红=risk-off）</div>
+        <ScoreChart
+          client:load
+          points={regimePoints.slice(-180).map((p) => ({ date: p.date, score: p.score }))}
+          bands={bands.filter((b) => b.end >= (regimePoints.at(-180)?.date ?? "9999"))}
+          scoreHigh={e.regime.scoreHigh}
+          scoreLow={e.regime.scoreLow}
+          scoreRelease={e.regime.scoreRelease}
+          short
+        />
+      </div>
     </div>
-    <div class="card reveal d6">
-      <h3>综合分 · 近 180 天（色带 = 体制）</h3>
-      <ScoreChart
-        client:load
-        points={recent.map((p) => ({ date: p.date, score: p.score }))}
-        bands={bands.filter((b) => b.end >= (recent[0]?.date ?? "9999"))}
-        scoreHigh={0.6}
-        scoreLow={0.3}
-        short
-      />
+
+    <div class="panel">
+      <div class="panel-hd"><h2>信号分量</h2><span class="hint">百分位 + 原始读数</span></div>
+      <div class="panel-bd">
+        {sigMeta.map((s) => {
+          const v = sigValues[s.key] ?? 0;
+          const m = macro[s.series];
+          const chg = m?.prevQ ? m.value / m.prevQ - 1 : null;
+          return (
+            <div class="sig" style="grid-template-columns:88px 1fr 46px 132px">
+              <div class="n">{s.name}<em>权重 {fmtPct(s.w, 0)}</em></div>
+              <div class="bar lg"><i style={`width:${v * 100}%;background:var(--${v >= 0.6 ? "up" : v <= 0.4 ? "down" : "yellow"})`}></i></div>
+              <div class:list={["v", sigColor(v)]}>{v.toFixed(2)}</div>
+              <div class="raw">
+                <b>{m ? s.fmt(m.value) : "—"}</b>
+                {m ? `${s.series} ${m.asOf}` : "无读数"}
+                {chg !== null && <span class={chg >= 0 ? "up" : "down"}> · 13周 {chg >= 0 ? "+" : ""}{(chg * 100).toFixed(1)}%</span>}
+              </div>
+            </div>
+          );
+        })}
+        <div class="sep"></div>
+        <div class="faint" style="line-height:1.7">
+          {sigMeta.map((s) => <div>· <b style="color:var(--text-3)">{s.name}</b>（{s.series}）：{s.desc}</div>)}
+          <div style="margin-top:6px">
+            百分位读的是"当前相对自己过去 3 年的位置"，所以匀速漂移读数≈0.5，只有<b>加速转变</b>才推向极值——
+            这正是低换手的来源。{macro.SP500 && macro.SP500.sma200 ? <>标普 {macro.SP500.value.toFixed(0)} 对 200 日均线 {macro.SP500.sma200.toFixed(0)}，偏离 <b class={macro.SP500.value >= macro.SP500.sma200 ? "up" : "down"}>{((macro.SP500.value / macro.SP500.sma200 - 1) * 100).toFixed(1)}%</b>。</> : ""}
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
-  <div class="section-title reveal d6">四引擎状态</div>
-  <div class="grid grid-4">
-    {engines.map((e, i) => (
-      <div class={`card reveal d${Math.min(7, i + 5)}`}>
-        <div class={`engine-icon ${e.cls}`} set:html={e.icon}></div>
-        <h3 style="margin-bottom:6px">{e.name}</h3>
-        <div class="muted" style="font-size:12.5px">{e.desc}</div>
+  <div class="grid g-4" style="margin-top:12px">
+    {engines.map((eng) => (
+      <div class="eng">
+        <div class:list={["eng-ic", eng.cls]}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" set:html={eng.icon} /></div>
+        <div style="min-width:0">
+          <h3>{eng.name}</h3>
+          <div class="rule">{eng.rule}</div>
+          <div class="state">{eng.state.map((tk) => (typeof tk === "string" ? tk : <b class={tk.cls}>{tk.b}</b>))}</div>
+        </div>
       </div>
     ))}
   </div>
 
-  <div class="section-title reveal d7">当前持仓（paper）</div>
-  <div class="grid grid-2">
-    <div class="card reveal d8">
-      <h3>权重 vs 目标</h3>
-      {weights.map((w) => (
-        <div class="weight-row">
-          <span class="t">{w.ticker}</span>
-          <div class="bar"><div class="fill" style={`--w: ${Math.min(100, w.weight * 400)}%`}></div></div>
-          <span class="v">{fmtPct(w.weight)}</span>
-        </div>
-      ))}
-      <div class="faint" style="margin-top:10px">现金 {fmtUsd(cash)} · 等权目标 {fmtPct(target)}/只</div>
-    </div>
-    <div class="card reveal d8">
-      <h3>最近交易（paper）</h3>
-      <table>
-        <thead><tr><th>日期</th><th>标的</th><th>方向</th><th>金额</th><th>引擎</th></tr></thead>
-        <tbody>
-          {paperTrades.map((t) => (
+  <div class="grid g-21" style="margin-top:12px">
+    <div class="panel">
+      <div class="panel-hd">
+        <h2>当前持仓</h2><span class="hint">paper · 等权目标 {fmtPct(targetEach, 1)}/只</span>
+        <div class="right"><span class="faint">现金 {fmtUsd(cash)}</span></div>
+      </div>
+      <div class="panel-bd flush">
+        <table class="tbl">
+          <thead>
+            <tr><th class="l">标的</th><th>持仓</th><th>收盘价</th><th>市值</th><th>权重</th><th>目标</th><th>偏离</th><th class="l">链上溢价</th></tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr>
+                <td class="l t">
+                  <div class="sym"><a class="tk" href={`/ticker/${r.ticker}`}>{r.ticker}</a>{r.b?.symbol && <i>{r.b.symbol} · {r.b.platform}</i>}{inWindow(r.ticker) && <span class="pill earnings">财报窗口</span>}</div>
+                </td>
+                <td>{r.units.toFixed(4)}</td>
+                <td>{r.close.toFixed(2)}</td>
+                <td class="strong">{fmtUsd(r.value)}</td>
+                <td>{fmtPct(r.weight, 2)}</td>
+                <td class="dim">{fmtPct(r.tgt, 2)}</td>
+                <td class={Math.abs(r.drift) > e.drift.thresholdPp ? "down strong" : Math.abs(r.drift) > 1 ? "yel" : "dim"}>{r.drift >= 0 ? "+" : ""}{r.drift.toFixed(2)}pp</td>
+                <td class="l">{r.b?.premium === null || r.b?.premium === undefined ? <span class="faint">—</span> : <span class={r.b.premium >= 0 ? "down" : "up"}>{(r.b.premium * 100).toFixed(3)}%</span>}</td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
             <tr>
-              <td>{t.date}</td>
-              <td>{t.ticker}</td>
-              <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
-              <td>{fmtUsd(t.notional_usdt)}</td>
-              <td class="text">
-                {parseDrivers(t.reason).map((d) => (
-                  <span class={`pill ${d}`}>{DRIVER_LABEL[d]}</span>
+              <td class="l t"><div class="sym"><b>USDT</b><i>稳定币腿 · 等待部署</i></div></td>
+              <td class="dim">—</td>
+              <td class="dim">1.00</td>
+              <td class="strong">{fmtUsd(cash)}</td>
+              <td>{fmtPct(cashWeight, 2)}</td>
+              <td class="dim">{fmtPct(cashTarget, 2)}</td>
+              <td class={Math.abs(cashWeight - cashTarget) > e.drift.thresholdPp ? "down strong" : "dim"}>{cashWeight - cashTarget >= 0 ? "+" : ""}{((cashWeight - cashTarget) * 100).toFixed(2)}pp</td>
+              <td class="l faint">—</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="panel">
+        <div class="panel-hd"><h2>财报排程</h2><span class="hint">未来 60 天</span></div>
+        <div class="panel-bd flush">
+          {nextEarn.length === 0 ? (
+            <div class="empty">{cover.rows === 0 ? "财报日历未同步" : "未来 60 天篮子内无财报"}</div>
+          ) : (
+            <table class="tbl">
+              <thead><tr><th class="l">标的</th><th>日期</th><th>倒计时</th><th class="l">引擎动作</th></tr></thead>
+              <tbody>
+                {nextEarn.map((n) => (
+                  <tr>
+                    <td class="l t"><b>{n.ticker}</b></td>
+                    <td class="dim">{n.date}</td>
+                    <td class={n.daysAway <= 5 ? "down strong" : n.daysAway <= 10 ? "yel" : ""}>T-{n.daysAway}</td>
+                    <td class="l faint">{inWindow(n.ticker) ? <span class="pill earnings">已减半 ×{e.earnings.scaleFactor}</span> : `前 ${e.earnings.riskOffDaysBefore} 天减半`}</td>
+                  </tr>
                 ))}
-              </td>
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-hd"><h2>体制时间分布</h2><span class="hint">回测 {regimePoints.length.toLocaleString()} 个交易日</span></div>
+        <div class="panel-bd">
+          {Object.entries(run?.regime_days ?? {}).map(([r, d]) => (
+            <div class="sig" style="grid-template-columns:96px 1fr 46px 74px">
+              <div class="n">{REGIME_LABEL[r] ?? r}</div>
+              <div class="bar"><i style={`width:${(d / (regimePoints.length || 1)) * 100}%;background:var(--${r === "riskOn" ? "up" : r === "riskOff" ? "down" : "blue"})`}></i></div>
+              <div class="v">{((d / (regimePoints.length || 1)) * 100).toFixed(0)}%</div>
+              <div class="raw"><b>{d.toLocaleString()}</b>天 · {((e.regime.allocation[r] ?? 0) * 100).toFixed(0)}%</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd">
+      <h2>最近交易</h2><span class="hint">paper 执行记录 · 逐笔标注全部触发引擎</span>
+      <div class="right"><a href="/trades" class="chip">全部 {paperTrades.length} 笔 →</a></div>
+    </div>
+    <div class="panel-bd flush">
+      <table class="tbl">
+        <thead><tr><th class="l">日期</th><th class="l">标的</th><th class="l">方向</th><th>数量</th><th>金额</th><th class="l">触发引擎</th></tr></thead>
+        <tbody>
+          {paperTrades.slice(0, 10).map((t) => (
+            <tr>
+              <td class="l dim">{t.date}</td>
+              <td class="l t"><b>{t.ticker}</b></td>
+              <td class:list={["l", t.units_delta >= 0 ? "up" : "down"]}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
+              <td>{Math.abs(t.units_delta).toFixed(4)}</td>
+              <td class="strong">{fmtUsd(t.notional_usdt)}</td>
+              <td class="l t">{parseDrivers(t.reason).map((d) => <span class={`pill ${d}`}>{DRIVER_LABEL[d]}</span>)}</td>
             </tr>
           ))}
-          {paperTrades.length === 0 && <tr><td colspan="5" class="text faint">暂无交易 —— 运行 npm run agent 开始</td></tr>}
+          {paperTrades.length === 0 && <tr><td colspan="6" class="empty">暂无记录 —— 运行 <code>npm run agent</code></td></tr>}
         </tbody>
       </table>
     </div>
   </div>
 
-  <div class="section-title reveal d8">策略净值（回测 run #{run?.id ?? "—"}）</div>
-  <div class="card reveal d8">
-    {run && <EquityChart client:load strategy={run.equity.strategy} benchmark={run.equity.benchmark} bands={bands} />}
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd">
+      <h2>策略净值 vs 买入持有</h2><span class="hint">同现金流：初始 {fmtUsd(startCash)} + 每周 {fmtUsd(e.dca.amountUsdt)}</span>
+      <div class="right">
+        <span class="chip">策略夏普 {run?.metrics.strategy.sharpe.toFixed(2)}</span>
+        <span class="chip">基准夏普 {run?.metrics.benchmark.sharpe.toFixed(2)}</span>
+        <a href="/backtest" class="chip">回测详情 →</a>
+      </div>
+    </div>
+    <div class="panel-bd">{run && <EquityChart client:load strategy={run.equity.strategy} benchmark={run.equity.benchmark} bands={bands} />}</div>
   </div>
-
-  <script>
-    const easeOut = (t: number) => 1 - Math.pow(1 - t, 3);
-    document.querySelectorAll<HTMLElement>("[data-countup]").forEach((el) => {
-      const targetValue = parseFloat(el.dataset.countup!);
-      const decimals = parseInt(el.dataset.decimals ?? "0", 10);
-      const prefix = el.dataset.prefix ?? "";
-      const suffix = el.dataset.suffix ?? "";
-      const duration = 1300;
-      const start = performance.now();
-      const step = (now: number) => {
-        const p = Math.min(1, (now - start) / duration);
-        const v = targetValue * easeOut(p);
-        el.textContent = prefix + v.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals }) + suffix;
-        if (p < 1) requestAnimationFrame(step);
-      };
-      requestAnimationFrame(step);
-    });
-  </script>
 </Base>

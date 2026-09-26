@@ -1,56 +1,190 @@
 ---
 import Base from "../layouts/Base.astro";
 import { getTrades } from "../lib/db";
-import { DRIVER_LABEL, parseDrivers } from "../lib/drivers";
+import { DRIVER_LABEL, parseDrivers, type Driver } from "../lib/drivers";
+import { readFileSync } from "node:fs";
+
+const dcaUsdt = (JSON.parse(readFileSync("../config/strategy.json", "utf8")) as {
+  engines: { dca: { amountUsdt: number } };
+}).engines.dca.amountUsdt;
 
 const paperTrades = await getTrades("paper", 200);
 const backtestTrades = await getTrades("backtest", 60);
 
 const fmt = (v: number) => `$${Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
----
-<Base active="trades">
-  <div class="hero reveal" style="padding-bottom:0">
-    <h1>交易<span class="grad">流水</span></h1>
-    <p>每一笔成交标注<b>全部</b>触发引擎 —— 定投 · 体制 · 漂移 · 财报可同日共触发，未来 live 模式的 RFQ 真实成交同样入账</p>
+
+/** 引擎归因：一笔周五恰逢体制切换的调仓会同时挂两个驱动，所以按"触发次数"而非"笔数"统计 */
+const attribution = (["seed", "dca", "regime", "drift", "earnings"] as Driver[]).map((d) => {
+  const hit = paperTrades.filter((t) => parseDrivers(t.reason).includes(d));
+  const buy = hit.filter((t) => t.units_delta >= 0).reduce((a, t) => a + t.notional_usdt, 0);
+  const sell = hit.filter((t) => t.units_delta < 0).reduce((a, t) => a + Math.abs(t.notional_usdt), 0);
+  return { d, count: hit.length, buy, sell, last: hit[0]?.date ?? "—" };
+});
+const totalHits = attribution.reduce((a, r) => a + r.count, 0);
+const maxHit = Math.max(1, ...attribution.map((r) => r.count));
+const buys = paperTrades.filter((t) => t.units_delta >= 0).reduce((a, t) => a + t.notional_usdt, 0);
+const sells = paperTrades.filter((t) => t.units_delta < 0).reduce((a, t) => a + Math.abs(t.notional_usdt), 0);
+const days = new Set(paperTrades.map((t) => t.date)).size;
+
+const pillColor: Record<string, string> = {
+  seed: "text-3",
+  dca: "blue",
+  regime: "yellow",
+  drift: "purple",
+  earnings: "warn",
+};---
+<Base active="trades" crumb="交易流水" sub="每一笔成交标注全部触发引擎 —— 定投 · 体制 · 漂移 · 财报可同日共触发">
+  <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
+    <span class="chip">paper {paperTrades.length} 笔</span>
+    <span class="chip">backtest 抽样 {backtestTrades.length} 笔</span>
   </div>
 
-  <div class="section-title reveal d1" style="margin-top: 26px">Paper 执行记录 <span class="faint" style="font-weight:400">{paperTrades.length} 笔 · 每次运行 npm run agent 产生</span></div>
-  <div class="card reveal d1">
-    <table>
-      <thead><tr><th>日期</th><th>标的</th><th>方向</th><th>数量（股）</th><th>金额</th><th>触发引擎</th></tr></thead>
-      <tbody>
-        {paperTrades.map((t) => (
-          <tr>
-            <td>{t.date}</td>
-            <td>{t.ticker}</td>
-            <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
-            <td>{Math.abs(t.units_delta).toFixed(4)}</td>
-            <td>{fmt(t.notional_usdt)}</td>
-            <td class="text">{parseDrivers(t.reason).map((d) => <span class={`pill ${d}`}>{DRIVER_LABEL[d]}</span>)}</td>
-          </tr>
-        ))}
-        {paperTrades.length === 0 && <tr><td colspan="6" class="text faint">暂无记录</td></tr>}
-      </tbody>
-    </table>
+  <div class="tiles">
+    <div class="tile">
+      <div class="tile-k">Paper 成交笔数</div>
+      <div class="tile-v">{paperTrades.length}</div>
+      <div class="tile-s">跨 {days} 个交易日 · 每笔均可回溯到 npm run agent 的一轮</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">累计买入</div>
+      <div class="tile-v up">{fmt(buys)}</div>
+      <div class="tile-s">{paperTrades.filter((t) => t.units_delta >= 0).length} 笔</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">累计卖出</div>
+      <div class="tile-v down">{fmt(sells)}</div>
+      <div class="tile-s">{paperTrades.filter((t) => t.units_delta < 0).length} 笔</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">净投入（买 − 卖）</div>
+      <div class="tile-v">{fmt(buys - sells)}</div>
+      <div class="tile-s">定投每周 {fmt(dcaUsdt)} 是唯一外部现金来源</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">驱动触发总数</div>
+      <div class="tile-v sm">{totalHits}</div>
+      <div class="tile-s">一笔多引擎共用 → 触发数 ≥ 笔数</div>
+    </div>
   </div>
 
-  <div class="section-title reveal d2">回测成交抽样 <span class="faint" style="font-weight:400">最近 60 笔 · 按日期倒序</span></div>
-  <div class="card reveal d2">
-    <table>
-      <thead><tr><th>日期</th><th>标的</th><th>方向</th><th>金额</th><th>触发引擎</th></tr></thead>
-      <tbody>
-        {backtestTrades.map((t) => (
-          <tr>
-            <td>{t.date}</td>
-            <td>{t.ticker}</td>
-            <td class={t.units_delta >= 0 ? "up" : "down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
-            <td>{fmt(t.notional_usdt)}</td>
-            <td class="text">{parseDrivers(t.reason).map((d) => <span class={`pill ${d}`}>{DRIVER_LABEL[d]}</span>)}</td>
-          </tr>
-        ))}
-        {backtestTrades.length === 0 && <tr><td colspan="5" class="text faint">暂无记录 —— 运行 npm run backtest</td></tr>}
-      </tbody>
-    </table>
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd"><h2>引擎归因</h2><span class="hint">哪个引擎在真正驱动换手 · paper 全量</span></div>
+    <div class="panel-bd">
+      {attribution.map((r) => (
+        <div class="sig" style="grid-template-columns:84px 1fr 76px 118px">
+          <div class="n">{DRIVER_LABEL[r.d]}<em>{r.d}</em></div>
+          <div class="bar lg"><i style={`width:${(r.count / maxHit) * 100}%;background:var(--${pillColor[r.d]})`}></i></div>
+          <div class:list={["v", r.count ? "yel" : "faint"]}>{r.count} 次</div>
+          <div class="raw">
+            <b>{r.buy ? `买 ${fmt(r.buy)}` : r.sell ? `卖 ${fmt(r.sell)}` : "未触发"}</b>
+            最近 {r.last}
+          </div>
+        </div>
+      ))}
+      <div class="sep"></div>
+      <div class="faint" style="line-height:1.65">
+        <b class="mono">earnings = 0</b> 不是坏了 —— 财报引擎在<b>窗口外</b>本就应当不动作，日历有 175 条真实日期、最近一场 T-25 天。
+        真要看到它出手，等 T-2 那天执行器把该股目标权重砍半即可，届时的卖出会挂 <span class="pill earnings">财报</span> 标签。
+      </div>
+    </div>
   </div>
-  <div class="faint reveal d3" style="margin-top: 10px">完整回测成交序列存于 Postgres trades 表（mode = backtest）；live 模式上线后 RFQ 真实成交将记于 mode = live。</div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd">
+      <h2>Paper 执行记录</h2><span class="hint">点引擎标签筛选 · 溢价列 = 该笔相对美股参考价多付/多收的部分，— 为接入溢价之前的记录</span>
+      <div class="right">
+        <button class="chip" data-all="1" type="button">全部</button>
+        {attribution.filter((r) => r.count > 0).map((r) => (
+          <button class="chip" data-filter={r.d} type="button">{DRIVER_LABEL[r.d]} {r.count}</button>
+        ))}
+      </div>
+    </div>
+    <div class="panel-bd flush">
+      <table class="tbl" id="paper-tbl">
+        <thead><tr><th class="l">日期</th><th class="l">标的</th><th class="l">方向</th><th>数量（股）</th><th>金额</th><th>链上溢价</th><th class="l">触发引擎</th></tr></thead>
+        <tbody>
+          {paperTrades.map((t) => {
+            const ds = parseDrivers(t.reason);
+            // 溢价成本 = 名义额里属于"比参考价贵"的那一截；成交早于溢价接入的记录为 null，显示 —
+            const cost = t.premium === null || t.premium === undefined ? null : (t.notional_usdt * t.premium) / (1 + t.premium);
+            return (
+              <tr data-drivers={ds.join(" ")}>
+                <td class="l dim">{t.date}</td>
+                <td class="l t"><a class="tk" href={`/ticker/${t.ticker}`}>{t.ticker}</a></td>
+                <td class={t.units_delta >= 0 ? "l up" : "l down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
+                <td>{Math.abs(t.units_delta).toFixed(4)}</td>
+                <td class="strong">{fmt(t.notional_usdt)}</td>
+                <td>
+                  {cost === null ? (
+                    <span class="faint">—</span>
+                  ) : (
+                    <>
+                      <span class={t.premium! >= 0 ? "down" : "up"}>{(t.premium! * 100).toFixed(3)}%</span>
+                      <span class="faint"> {cost >= 0 ? "+" : "−"}${Math.abs(cost).toFixed(2)}</span>
+                    </>
+                  )}
+                </td>
+                <td class="l t">{ds.map((d) => <span class={`pill ${d}`}>{DRIVER_LABEL[d]}</span>)}</td>
+              </tr>
+            );
+          })}
+          {paperTrades.length === 0 && <tr><td colspan="7" class="empty">暂无记录 —— 运行 <code>npm run agent</code></td></tr>}
+        </tbody>
+      </table>
+      <div class="empty" id="paper-none" hidden>该引擎在 paper 流水里没有记录</div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd"><h2>回测成交抽样</h2><span class="hint">最近 {backtestTrades.length} 笔 · 按日期倒序 · 完整序列见 trades 表 mode=backtest</span></div>
+    <div class="panel-bd flush">
+      <table class="tbl">
+        <thead><tr><th class="l">日期</th><th class="l">标的</th><th class="l">方向</th><th>金额</th><th class="l">触发引擎</th></tr></thead>
+        <tbody>
+          {backtestTrades.map((t) => (
+            <tr>
+              <td class="l dim">{t.date}</td>
+              <td class="l t"><a class="tk" href={`/ticker/${t.ticker}`}>{t.ticker}</a></td>
+              <td class={t.units_delta >= 0 ? "l up" : "l down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
+              <td class="strong">{fmt(t.notional_usdt)}</td>
+              <td class="l t">{parseDrivers(t.reason).map((d) => <span class={`pill ${d}`}>{DRIVER_LABEL[d]}</span>)}</td>
+            </tr>
+          ))}
+          {backtestTrades.length === 0 && <tr><td colspan="5" class="empty">暂无记录 —— 运行 <code>npm run backtest</code></td></tr>}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="note" style="margin-top:12px">
+    <span class="ic">◇</span>
+    <div>
+      live 模式上线后，RFQ 真实成交会记在同一张表的 <code>mode = live</code> 下，并额外带 <code>tx</code> 哈希列 ——
+      纸面与真实的成交共用一套归因口径，这是"回测 → paper → live"三段可对照的前提。
+    </div>
+  </div>
+
+  <script>
+    const tbl = document.getElementById("paper-tbl");
+    const none = document.getElementById("paper-none");
+    if (tbl && none) {
+      const rows = [...tbl.querySelectorAll<HTMLTableRowElement>("tbody tr[data-drivers]")];
+      const show = (key: string | null) => {
+        let n = 0;
+        for (const r of rows) {
+          const ok = !key || r.dataset.drivers!.split(" ").includes(key);
+          r.hidden = !ok;
+          if (ok) n++;
+        }
+        none.hidden = n !== 0;
+      };
+      for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-filter],[data-all]")) {
+        btn.addEventListener("click", () => {
+          for (const b of document.querySelectorAll<HTMLButtonElement>(".chip")) b.classList.remove("ok");
+          btn.classList.add("ok");
+          show(btn.dataset.filter ?? null);
+        });
+      }
+    }
+  </script>
 </Base>

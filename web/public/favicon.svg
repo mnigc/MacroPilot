@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="MacroPilot">
+  <defs>
+    <linearGradient id="mp-gold" x1="6" y1="2" x2="58" y2="62" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FDE04B"/>
+      <stop offset="0.55" stop-color="#FCD535"/>
+      <stop offset="1" stop-color="#E8A600"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="url(#mp-gold)"/>
+  <path d="M12.5 47.5 25 27 35 38.5 48 23" fill="none" stroke="#0A0C10" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M55.4 14.2 54.3 28.3 41.7 17.7Z" fill="#0A0C10"/>
+</svg>

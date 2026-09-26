@@ -1,0 +1,201 @@
+---
+import Base from "../../layouts/Base.astro";
+import { KlineChart, type KTrade } from "../../components/charts";
+import { regimeBands, REGIME_LABEL } from "../../lib/bands";
+import { DRIVER_LABEL, parseDrivers } from "../../lib/drivers";
+import { getLatestRun, getRegimePoints, getRunTrades, getTickerBoard, getTrades } from "../../lib/db";
+import { readSeries } from "../../lib/prices";
+
+export async function getStaticPaths() {
+  const run = await getLatestRun();
+  return (run?.tickers ?? []).map((ticker) => ({ params: { ticker } }));
+}
+
+const ticker = Astro.params.ticker as string;
+
+const run = await getLatestRun();
+const allTickers: string[] = run?.tickers ?? [];
+const regimePoints = run ? await getRegimePoints(run.id) : [];
+const board = await getTickerBoard([ticker]);
+const me = board.find((b) => b.ticker === ticker);
+
+const from = regimePoints[0]?.date ?? "2020-01-01";
+const series = readSeries(ticker, from);
+const { dates, closes, ohlc } = series;
+const last = closes[closes.length - 1] ?? 0;
+const prev = closes[closes.length - 2] ?? last;
+const dayChg = prev ? last / prev - 1 : 0;
+
+/**
+ * 买卖点取回测 run 的成交流水：paper 账户至今只有 7 笔同日种子，画在 K 线上没有信息量。
+ * notional_usdt 恒为正、方向看 units_delta 的符号。
+ */
+const tx = (run ? await getRunTrades(run.id) : []).filter((t) => t.ticker === ticker);
+const paperCount = (await getTrades("paper", 200)).filter((t) => t.ticker === ticker).length;
+
+const position = new Array<number>(dates.length).fill(0);
+
+type Lot = { units: number; price: number };
+const lots: Lot[] = [];
+const marks: KTrade[] = [];
+let buyTotal = 0;
+let sellTotal = 0;
+let realizedTotal = 0;
+let wins = 0;
+let sells = 0;
+
+for (const t of tx) {
+  const units = Math.abs(t.units_delta);
+  if (!units) continue;
+  const price = t.notional_usdt / units;
+  const driver = parseDrivers(t.reason).map((d) => DRIVER_LABEL[d]).join(" + ") || t.reason;
+  if (t.units_delta > 0) {
+    lots.push({ units, price });
+    buyTotal += t.notional_usdt;
+    marks.push({ date: t.date, side: "buy", units, price, notional: t.notional_usdt, realized: null, ret: price ? last / price - 1 : null, driver });
+  } else {
+    let left = units;
+    let cost = 0;
+    while (left > 1e-12 && lots.length) {
+      const lot = lots[0] as Lot;
+      const take = Math.min(lot.units, left);
+      cost += take * lot.price;
+      lot.units -= take;
+      left -= take;
+      if (lot.units <= 1e-12) lots.shift();
+    }
+    const realized = t.notional_usdt - cost;
+    realizedTotal += realized;
+    sellTotal += t.notional_usdt;
+    sells += 1;
+    if (realized > 0) wins += 1;
+    marks.push({ date: t.date, side: "sell", units, price, notional: t.notional_usdt, realized, ret: cost ? realized / cost : null, driver });
+  }
+}
+
+/** 逐日累计持仓：游标按日期推进，成交日若不在交易日历上就顺延到下一根 K 线 */
+{
+  let units = 0;
+  let i = 0;
+  for (const t of tx) {
+    while (i < dates.length && dates[i] < t.date) position[i++] = units;
+    units += t.units_delta;
+  }
+  while (i < dates.length) position[i++] = units;
+}
+
+const openUnits = lots.reduce((a, l) => a + l.units, 0);
+const openCost = lots.reduce((a, l) => a + l.units * l.price, 0);
+const marketValue = openUnits * last;
+const unrealized = marketValue - openCost;
+const totalPnl = realizedTotal + unrealized;
+const avgCost = openUnits ? openCost / openUnits : 0;
+const bands = regimeBands(regimePoints.map((p) => p.date), regimePoints.map((p) => p.regime));
+
+const fmtUsd = (v: number, d = 0) => `$${Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d })}`;
+const fmtSigned = (v: number, d = 0) => `${v >= 0 ? "+" : "−"}${fmtUsd(v, d)}`;
+const fmtPct = (v: number, d = 2) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(d)}%`;
+const cls = (v: number) => (v >= 0 ? "up" : "down");
+const recent = [...marks].reverse().slice(0, 24);
+const buyCount = marks.length - sells;
+const hi52 = Math.max(...closes.slice(-252));
+const lo52 = Math.min(...closes.slice(-252));
+
+const tiles: { k: string; v: string; s: string; c?: string }[] = [
+  { k: "最新收盘", v: last.toFixed(2), s: `${me?.platform ?? "—"} · ${me?.symbol ?? ""}`, c: cls(dayChg) },
+  { k: "累计买入", v: fmtUsd(buyTotal), s: `${buyCount} 笔 · 含体制与漂移调仓` },
+  { k: "已实现盈亏", v: fmtSigned(realizedTotal), s: `${sells} 笔平仓 · 胜率 ${sells ? ((wins / sells) * 100).toFixed(0) : "—"}%`, c: cls(realizedTotal) },
+  { k: "浮动盈亏", v: fmtSigned(unrealized), s: `持仓 ${openUnits.toFixed(4)} 股 · 成本 ${avgCost ? avgCost.toFixed(2) : "—"}`, c: cls(unrealized) },
+  { k: "该标的总盈亏", v: fmtSigned(totalPnl), s: `占投入 ${buyTotal ? fmtPct(totalPnl / buyTotal) : "—"}`, c: cls(totalPnl) },
+  { k: "52 周区间", v: `${lo52.toFixed(0)}–${hi52.toFixed(0)}`, s: `现价位于 ${((last - lo52) / Math.max(hi52 - lo52, 0.01) * 100).toFixed(0)}% 分位` },
+];
+---
+<Base active="ticker" crumb={`${ticker} · 标的走势`} sub="K 线 + 体制色带 + 每一笔买卖点，金额与收益率在点上">
+  <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
+    <span class:list={["badge", "neutral"]}><span class="dot"></span>{dayChg >= 0 ? "▲" : "▼"} {fmtPct(dayChg)}</span>
+    <span class="chip">回测 run #{run?.id ?? "—"}</span>
+  </div>
+
+  <nav class="ktabs">
+    {allTickers.map((t) => (
+      <a href={`/ticker/${t}`} class:list={["ktab", { on: t === ticker }]}>{t}</a>
+    ))}
+  </nav>
+
+  <div class="tiles" style="margin-top:12px">
+    {tiles.map((p) => (
+      <div class="tile">
+        <div class="tile-k">{p.k}</div>
+        <div class:list={["tile-v", "sm", p.c ?? ""]}>{p.v}</div>
+        <div class="tile-s">{p.s}</div>
+      </div>
+    ))}
+  </div>
+
+  <div class="grid g-21" style="margin-top:12px">
+    <section class="panel">
+      <div class="panel-hd">
+        <h2>{ticker} 价格与执行</h2>
+        <span class="hint">{ohlc ? "日 K · OHLC" : "收盘价折线 · OHLC 待同步"} · 背景色带 = 宏观体制 · 下方蓝区 = 持仓股数</span>
+        <div class="right"><span class="faint mono">{dates.length} 根 · {from} → {dates[dates.length - 1]}</span></div>
+      </div>
+      <div class="panel-bd">
+        <KlineChart
+          client:load
+          dates={dates}
+          ohlc={ohlc}
+          closes={closes}
+          position={position}
+          trades={marks}
+          bands={bands}
+        />
+        <div class="klegend">
+          <span><i class="tri up"></i>买入 {buyCount} 笔</span>
+          <span><i class="tri down"></i>卖出 {sells} 笔</span>
+          <span><i class="sw" style="background:rgba(14,203,129,.28)"></i>{REGIME_LABEL.riskOn}</span>
+          <span><i class="sw" style="background:rgba(75,155,255,.28)"></i>{REGIME_LABEL.neutral}</span>
+          <span><i class="sw" style="background:rgba(246,70,93,.28)"></i>{REGIME_LABEL.riskOff}</span>
+          <span class="faint">悬停任意一天看开高低收、当日全部成交与触发引擎 · 底部滑块拖回 2020 年</span>
+        </div>
+        <div class="sep"></div>
+        <div class="faint" style="line-height:1.7">
+          {ohlc
+            ? <>K 线取自 <b class="mono">data/prices/{ticker}.csv</b> 的复权 OHLC，与回测用的是同一列 close，所以买卖点落在同一根柱子上。</>
+            : <>当前 CSV 只有 <b class="mono">date,value</b> 两列，图表降级为收盘价折线。<b>买卖点、持仓面积、体制色带都已就绪</b>，等 <b class="mono">sync-prices.py</b> 补齐 open/high/low 后自动变成真正的 K 线，页面代码不用改。</>}
+          买卖点数据来自回测 run #{run?.id ?? "—"} 的 {marks.length} 笔成交；纸面账户在本标的只有 {paperCount} 笔同日种子，画出来是一条竖线，故不并入。
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-hd"><h2>最近成交</h2><span class="hint">倒序 {recent.length} / {marks.length} 笔</span></div>
+      <div class="panel-bd flush">
+        <table class="tbl">
+          <thead><tr><th class="l">日期</th><th class="l">方向</th><th>成交价</th><th>金额</th><th class="r">盈亏</th></tr></thead>
+          <tbody>
+            {recent.map((t) => (
+              <tr>
+                <td class="l dim">{t.date}</td>
+                <td class={t.side === "buy" ? "l up" : "l down"}>{t.side === "buy" ? "▲ 买" : "▼ 卖"}</td>
+                <td>{t.price.toFixed(2)}</td>
+                <td class="strong">{fmtUsd(t.notional, 0)}</td>
+                <td class={t.realized === null ? cls(t.ret ?? 0) : cls(t.realized)}>
+                  {t.realized === null ? <span class="faint">{t.ret === null ? "—" : `至今 ${fmtPct(t.ret)}`}</span> : `${fmtSigned(t.realized)} · ${t.ret === null ? "—" : fmtPct(t.ret)}`}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-bd" style="border-top:1px solid var(--line-2)">
+        <div class="faint" style="line-height:1.7">
+          <b>盈亏口径</b>：卖出按 <b class="mono">FIFO</b> 逐批配对最早的成本，"盈亏"是该笔的<b>已实现</b>差额；
+          买入行的"至今"是<b>浮动</b>口径（现价 ÷ 该笔成交价 − 1），两者不可相加。
+          期末未平仓 {openUnits.toFixed(4)} 股、成本 {fmtUsd(openCost)}、市值 {fmtUsd(marketValue)}，
+          总盈亏 = 已实现 {fmtSigned(realizedTotal)} + 浮动 {fmtSigned(unrealized)}。
+          现金进出：累计买入 {fmtUsd(buyTotal)} · 累计卖出 {fmtUsd(sellTotal)}。
+        </div>
+      </div>
+    </section>
+  </div>
+</Base>

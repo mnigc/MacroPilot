@@ -7,7 +7,7 @@ export const BASE_URL = "https://web3.binance.com/build";
 // 且内置 undici 与外部 undici 的 dispatcher 不通用，故成对使用安装版 undiciFetch + ProxyAgent）
 const proxyUrl =
   process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy;
-const proxyDispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
+export const proxyDispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
 
 /** 统一响应信封：{ code, msg, data, timestamp, success }，code=0 表示成功 */
 export interface OCResult<T> {
@@ -50,8 +50,8 @@ export class BinanceWeb3Client {
     return this.request<T>("GET", path, params);
   }
 
-  post<T>(path: string, json: unknown): Promise<T> {
-    return this.request<T>("POST", path, undefined, json);
+  post<T>(path: string, json: unknown, params?: Record<string, string | number | undefined>): Promise<T> {
+    return this.request<T>("POST", path, params, json);
   }
 
   private async request<T>(

@@ -1,12 +1,18 @@
 ---
 import Base from "../layouts/Base.astro";
-import { EquityChart, ScoreChart } from "../components/charts";
+import { EquityChart, ScoreChart, SignalChart } from "../components/charts";
 import { regimeBands, REGIME_LABEL } from "../lib/bands";
 import { getLatestRun, getRegimePoints } from "../lib/db";
+import { readFileSync } from "node:fs";
+
+const startCashUsdt = (JSON.parse(readFileSync("../config/strategy.json", "utf8")) as {
+  execution: { startCashUsdt?: number };
+}).execution.startCashUsdt ?? 10_000;
 
 const run = await getLatestRun();
 const regimePoints = run ? await getRegimePoints(run.id) : [];
 const bands = regimeBands(regimePoints.map((p) => p.date), regimePoints.map((p) => p.regime));
+
 const params = (run?.params ?? {}) as {
   weights?: Record<string, number>;
   scoreHigh?: number;
@@ -16,105 +22,237 @@ const params = (run?.params ?? {}) as {
   dcaUsdt?: number;
   driftThresholdPp?: number;
   costBps?: number;
+  startCashUsdt?: number;
 };
 
-const fmtPct = (v: number, digits = 1) => `${(v * 100).toFixed(digits)}%`;
+const fmtPct = (v: number, digits = 1) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(digits)}%`;
+/** 仓位/占比不是"涨跌"，不带正负号 —— 和 fmtPct 分开，避免把 100% 目标仓位写成 +100% */
+const fmtRatio = (v: number, digits = 0) => `${(v * 100).toFixed(digits)}%`;
+const fmtUsd = (v: number) => `$${v.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
 const release = params.scoreRelease ?? ((params.scoreHigh ?? 0.6) + (params.scoreLow ?? 0.3)) / 2;
-const metricsOf = (m: { totalReturn: number; cagr: number; maxDrawdown: number; sharpe: number }) => [
-  { label: "总收益", value: fmtPct(m.totalReturn), cls: m.totalReturn >= 0 ? "up" : "down" },
-  { label: "CAGR", value: fmtPct(m.cagr), cls: m.cagr >= 0 ? "up" : "down" },
-  { label: "最大回撤", value: fmtPct(m.maxDrawdown), cls: "down" },
-  { label: "夏普比率", value: m.sharpe.toFixed(2), cls: m.sharpe >= 1 ? "up" : "" },
-];
 
-const regimeDays = run?.regime_days ?? {};
-const totalDays = Object.values(regimeDays).reduce((a, b) => a + b, 0) || 1;
 const period = regimePoints.length ? `${regimePoints[0]?.date} → ${regimePoints.at(-1)?.date}` : "—";
-const weights = run?.final_weights ?? {};
-const weightRows = Object.entries(weights).sort((a, b) => b[1] - a[1]);
-const regimeColor = (r: string) => (r === "riskOn" ? "#2ebd85" : r === "neutral" ? "#5b8def" : "#f6465d");
+const startCash = startCashUsdt;
+
+/** 两腿同现金流、同费率 —— 差值列是策略相对基准的净结果，负数不粉饰 */
+const compare = run
+  ? (
+      [
+        { k: "总收益", s: run.metrics.strategy.totalReturn, b: run.metrics.benchmark.totalReturn, pct: true },
+        { k: "年化 CAGR", s: run.metrics.strategy.cagr, b: run.metrics.benchmark.cagr, pct: true },
+        { k: "最大回撤", s: run.metrics.strategy.maxDrawdown, b: run.metrics.benchmark.maxDrawdown, pct: true },
+        { k: "夏普比率", s: run.metrics.strategy.sharpe, b: run.metrics.benchmark.sharpe, pct: false },
+        { k: "Calmar（年化/回撤）", s: run.metrics.strategy.cagr / Math.abs(run.metrics.strategy.maxDrawdown), b: run.metrics.benchmark.cagr / Math.abs(run.metrics.benchmark.maxDrawdown), pct: false },
+      ] as const
+    )
+  : [];
+
+/** 按全局历史高点计算逐日回撤，再归集到自然年 —— 与 headline maxDrawdown 同一口径，不另立标准 */
+const byYear = (() => {
+  if (!run) return [];
+  const rows = new Map<string, { year: string; sEnd: number; bEnd: number; sDd: number; bDd: number }>();
+  const step = (series: { date: string; value: number }[], key: "sEnd" | "bEnd" | "sDd" | "bDd") => {
+    let peak = -Infinity;
+    for (const p of series) {
+      peak = Math.max(peak, p.value);
+      const dd = p.value / peak - 1;
+      const y = p.date.slice(0, 4);
+      const row = rows.get(y) ?? { year: y, sEnd: 0, bEnd: 0, sDd: 0, bDd: 0 };
+      if (key === "sEnd" || key === "bEnd") row[key] = p.value;
+      else row[key] = Math.min(row[key], dd);
+      rows.set(y, row);
+    }
+  };
+  step(run.equity.strategy, "sEnd");
+  step(run.equity.benchmark, "bEnd");
+  step(run.equity.strategy, "sDd");
+  step(run.equity.benchmark, "bDd");
+  return [...rows.values()].sort((a, b) => a.year.localeCompare(b.year));
+})();
+
+const switches = (() => {
+  let n = 0;
+  for (let i = 1; i < regimePoints.length; i++) if (regimePoints[i].regime !== regimePoints[i - 1].regime) n++;
+  return n;
+})();
+
+const totalDays = regimePoints.length || 1;
+const riskOff2022 = regimePoints.filter((p) => p.date.startsWith("2022") && p.regime === "riskOff").length;
+const weightRows = Object.entries(run?.final_weights ?? {}).sort((a, b) => b[1] - a[1]);
+const regimeColor = (r: string) => (r === "riskOn" ? "up" : r === "riskOff" ? "down" : "blue");
 ---
-<Base active="backtest">
-  <div class="hero reveal" style="padding-bottom:0">
-    <h1>回测<span class="grad">实验室</span></h1>
-    <p>同一套四引擎策略，跑真实历史 —— 与同现金流买入持有公平对照</p>
+<Base active="backtest" crumb="回测实验室" sub={`真实历史 · 同现金流两腿对照 · run #${run?.id ?? "—"}`}>
+  <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
+    <span class="chip">区间 {period}</span>
+    <span class="chip">{regimePoints.length.toLocaleString()} 交易日 · 体制切换 {switches} 次</span>
   </div>
 
-  <div class="grid grid-2" style="margin-top: 22px;">
-    <div class="card accent-top reveal d1" style="border-color: rgba(240,185,11,0.22)">
-      <h3 style="color: var(--accent)">◆ 四引擎策略</h3>
-      <div class="grid" style="grid-template-columns: repeat(4, 1fr); margin-top: 6px;">
-        {run && metricsOf(run.metrics.strategy).map((m) => (
-          <div class="metric"><div class="label">{m.label}</div><div class={`value ${m.cls}`} style="font-size: 22px">{m.value}</div></div>
-        ))}
-      </div>
-    </div>
-    <div class="card reveal d2">
-      <h3 style="color: var(--text-2)">◇ 买入持有（同现金流基准）</h3>
-      <div class="grid" style="grid-template-columns: repeat(4, 1fr); margin-top: 6px;">
-        {run && metricsOf(run.metrics.benchmark).map((m) => (
-          <div class="metric"><div class="label">{m.label}</div><div class={`value ${m.cls}`} style="font-size: 22px; color: var(--text-2)">{m.value}</div></div>
-        ))}
-      </div>
-    </div>
-  </div>
-  <div class="faint reveal d2" style="margin-top: 10px">
-    回测区间 {period} · 初始 $10,000 + 每周定投 ${params.dcaUsdt} · 单边成本 {params.costBps}bps · 财报引擎因历史财报日不可回溯而在回测中关闭（执行器中生效）
-  </div>
-
-  <div class="section-title reveal d3">净值曲线 <span class="faint" style="font-weight:400">色带 = 宏观体制 · 可缩放</span></div>
-  <div class="card reveal d3">{run && <EquityChart client:load strategy={run.equity.strategy} benchmark={run.equity.benchmark} bands={bands} />}</div>
-
-  <div class="section-title reveal d4">宏观综合分与体制切换</div>
-  <div class="card reveal d4">
-    <ScoreChart
-      client:load
-      points={regimePoints.map((p) => ({ date: p.date, score: p.score }))}
-      bands={bands}
-      scoreHigh={params.scoreHigh ?? 0.6}
-      scoreLow={params.scoreLow ?? 0.3}
-      scoreRelease={release}
-    />
-  </div>
-
-  <div class="faint reveal d4" style="margin-top:10px">
-    这份样本（{period}）几乎全程单边牛市，择时的必然代价是<b>少赚绝对收益</b>——所以本项目的成绩按风险调整口径读：
-    最大回撤 {run ? fmtPct(run.metrics.strategy.maxDrawdown) : "—"} vs 基准 {run ? fmtPct(run.metrics.benchmark.maxDrawdown) : "—"}，
-    夏普 {run ? run.metrics.strategy.sharpe.toFixed(2) : "—"} vs {run ? run.metrics.benchmark.sharpe.toFixed(2) : "—"}；两腿现金流与费率待遇完全一致。
-  </div>
-
-  <div class="section-title reveal d5">体制分布与策略参数</div>
-  <div class="grid grid-2">
-    <div class="card reveal d5">
-      <h3>体制时间占比（共 {totalDays.toLocaleString()} 个交易日）</h3>
-      {Object.entries(regimeDays).map(([regime, days]) => (
-        <div class="signal-row">
-          <span class="name" style="width:110px">{REGIME_LABEL[regime] ?? regime}</span>
-          <div class="bar"><div class="fill" style={`--w: ${(days / totalDays) * 100}%; background: linear-gradient(90deg, ${regimeColor(regime)}55, ${regimeColor(regime)}); box-shadow: 0 0 10px ${regimeColor(regime)}44;`}></div></div>
-          <span class="num">{fmtPct(days / totalDays, 0)}</span>
+  {run ? (
+    <>
+      <div class="tiles">
+        <div class="tile">
+          <div class="tile-k">四引擎策略 · 期末净值</div>
+          <div class="tile-v">{fmtUsd(run.equity.strategy.at(-1)?.value ?? 0)}</div>
+          <div class="tile-s"><span class:list={["delta", run.metrics.strategy.totalReturn >= 0 ? "up" : "down"]}>{fmtPct(run.metrics.strategy.totalReturn)}</span> · CAGR {fmtPct(run.metrics.strategy.cagr)}</div>
         </div>
-      ))}
-      <div class="faint" style="margin-top:10px">2022 年（缩表 + 高波动）引擎有 240 个交易日停在 risk-off，目标仓位压到 25% —— 这是回撤近乎减半的来源</div>
-    </div>
-    <div class="card reveal d6">
-      <h3>策略参数（config/strategy.json）</h3>
-      <table>
-        <tbody>
-          <tr><td class="text muted">信号权重</td><td class="text">流动性 {params.weights?.liquidity} · 波动率 {params.weights?.volatility} · 利率 {params.weights?.rates} · 趋势 {params.weights?.trend}</td></tr>
-          <tr><td class="text muted">切换阈值</td><td>≥ {params.scoreHigh} risk-on · ≤ {params.scoreLow} risk-off · 极态回落需越过 {release.toFixed(2)}（三态滞回）</td></tr>
-          <tr><td class="text muted">目标仓位</td><td class="text">risk-on {fmtPct(params.allocation?.riskOn ?? 0, 0)} / neutral {fmtPct(params.allocation?.neutral ?? 0, 0)} / risk-off {fmtPct(params.allocation?.riskOff ?? 0, 0)}</td></tr>
-          <tr><td class="text muted">漂移阈值</td><td>±{params.driftThresholdPp}pp</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
+        <div class="tile">
+          <div class="tile-k">买入持有 · 期末净值</div>
+          <div class="tile-v" style="color:var(--text-2)">{fmtUsd(run.equity.benchmark.at(-1)?.value ?? 0)}</div>
+          <div class="tile-s"><span class:list={["delta", run.metrics.benchmark.totalReturn >= 0 ? "up" : "down"]}>{fmtPct(run.metrics.benchmark.totalReturn)}</span> · CAGR {fmtPct(run.metrics.benchmark.cagr)}</div>
+        </div>
+        <div class="tile">
+          <div class="tile-k">最大回撤</div>
+          <div class="tile-v down">{fmtPct(run.metrics.strategy.maxDrawdown)}</div>
+          <div class="tile-s">基准 {fmtPct(run.metrics.benchmark.maxDrawdown)} · <span class="delta up">改善 {((run.metrics.benchmark.maxDrawdown - run.metrics.strategy.maxDrawdown) * 100).toFixed(1)}pp</span></div>
+        </div>
+        <div class="tile">
+          <div class="tile-k">夏普比率</div>
+          <div class="tile-v up">{run.metrics.strategy.sharpe.toFixed(2)}</div>
+          <div class="tile-s">基准 {run.metrics.benchmark.sharpe.toFixed(2)} · 风险调整后占优</div>
+        </div>
+        <div class="tile">
+          <div class="tile-k">防御停泊</div>
+          <div class="tile-v sm">{run.regime_days.riskOff?.toLocaleString() ?? 0} 天</div>
+          <div class="tile-s">占 {fmtRatio((run.regime_days.riskOff ?? 0) / totalDays)} · 仓位 {fmtRatio(params.allocation?.riskOff)}</div>
+        </div>
+        <div class="tile">
+          <div class="tile-k">现金流假设</div>
+          <div class="tile-v sm">{fmtUsd(startCash)} + {fmtUsd(params.dcaUsdt ?? 0)}/周</div>
+          <div class="tile-s">单边 {params.costBps}bps · 两腿待遇一致</div>
+        </div>
+      </div>
 
-  <div class="section-title reveal d6">期末权重</div>
-  <div class="card reveal d6">
-    <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
-      {weightRows.map(([ticker, w]) => (
-        <div class="metric"><div class="label">{ticker}</div><div class="value" style="font-size: 19px">{fmtPct(w)}</div></div>
-      ))}
+      <div class="grid g-2" style="margin-top:12px">
+        <div class="panel">
+          <div class="panel-hd"><h2>绩效对照</h2><span class="hint">同一套现金流与费率，唯一差别是体制引擎是否在位</span></div>
+          <div class="panel-bd flush">
+            <table class="tbl">
+              <thead><tr><th class="l">指标</th><th>四引擎策略</th><th>买入持有</th><th>差值</th></tr></thead>
+              <tbody>
+                {compare.map((c) => {
+                  const d = c.s - c.b;
+                  return (
+                    <tr>
+                      <td class="l t">{c.k}</td>
+                      <td class="strong">{c.pct ? fmtPct(c.s) : c.s.toFixed(2)}</td>
+                      <td class="dim">{c.pct ? fmtPct(c.b) : c.b.toFixed(2)}</td>
+                      <td class={d >= 0 ? "up" : "down"}>{c.pct ? `${d >= 0 ? "+" : ""}${(d * 100).toFixed(1)}pp` : `${d >= 0 ? "+" : ""}${d.toFixed(2)}`}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div class="panel-bd" style="padding-top:0">
+            <div class="faint" style="line-height:1.65">
+              样本区间几乎全程单边牛市，择时的必然代价就是<b>绝对收益少赚</b> —— 差值列把这件事直接摊开，不做粉饰。
+              本项目的成绩按风险调整口径读：峰值回撤被压缩到基准的
+              <b class="mono">{((Math.abs(run.metrics.strategy.maxDrawdown) / Math.abs(run.metrics.benchmark.maxDrawdown)) * 100).toFixed(0)}%</b>，
+              夏普 {run.metrics.strategy.sharpe.toFixed(2)} vs {run.metrics.benchmark.sharpe.toFixed(2)}。
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-hd"><h2>逐年净值与最深回撤</h2><span class="hint">回撤按历史高点计，与上表同口径</span></div>
+          <div class="panel-bd flush">
+            <table class="tbl">
+              <thead><tr><th class="l">年份</th><th>策略年末</th><th>基准年末</th><th>策略最深回撤</th><th>基准最深回撤</th></tr></thead>
+              <tbody>
+                {byYear.map((y) => (
+                  <tr>
+                    <td class="l t">{y.year}</td>
+                    <td>{fmtUsd(y.sEnd)}</td>
+                    <td class="dim">{fmtUsd(y.bEnd)}</td>
+                    <td class="down">{fmtPct(y.sDd)}</td>
+                    <td class={y.bDd <= -0.4 ? "down strong" : "down"}>{fmtPct(y.bDd)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div class="panel-bd" style="padding-top:0">
+            <div class="faint" style="line-height:1.65">
+              曲线含每周定投注入，年末净值是账户市值而非收益率。缩表 + 高波动那一年，引擎有 <b class="mono">{riskOff2022}</b> 个交易日停在 risk-off、
+              目标仓位 {fmtRatio(params.allocation?.riskOff)} —— 风险减半不是靠预测顶部，是靠不满仓过冬。
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:12px">
+        <div class="panel-hd">
+          <h2>净值曲线</h2><span class="hint">色带 = 宏观体制 · 底部滑块可缩放</span>
+          <div class="right"><span class="chip">初始 {fmtUsd(startCash)}</span><span class="chip">每周 {fmtUsd(params.dcaUsdt ?? 0)}</span></div>
+        </div>
+        <div class="panel-bd"><EquityChart client:load strategy={run.equity.strategy} benchmark={run.equity.benchmark} bands={bands} tall /></div>
+      </div>
+
+      <div class="grid g-32" style="margin-top:12px">
+        <div class="panel">
+          <div class="panel-hd">
+            <h2>宏观综合分与体制切换</h2><span class="hint">虚线 = 三个阈值 · 紫色为极态回落内沿</span>
+          </div>
+          <div class="panel-bd">
+            <ScoreChart
+              client:load
+              points={regimePoints.map((p) => ({ date: p.date, score: p.score }))}
+              bands={bands}
+              scoreHigh={params.scoreHigh ?? 0.6}
+              scoreLow={params.scoreLow ?? 0.3}
+              scoreRelease={release}
+            />
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-hd"><h2>体制时间分布</h2><span class="hint">共 {totalDays.toLocaleString()} 个交易日 · 切换 {switches} 次</span></div>
+          <div class="panel-bd">
+            {Object.entries(run.regime_days).map(([r, d]) => (
+              <div class="sig" style="grid-template-columns:96px 1fr 46px 74px">
+                <div class="n">{REGIME_LABEL[r] ?? r}</div>
+                <div class="bar lg"><i style={`width:${(d / totalDays) * 100}%;background:var(--${regimeColor(r)})`}></i></div>
+                <div class="v" style={`color:var(--${regimeColor(r)})`}>{fmtRatio(d / totalDays)}</div>
+                <div class="raw"><b>{d.toLocaleString()}</b>天 · {fmtRatio(params.allocation?.[r])}</div>
+              </div>
+            ))}
+            <div class="sep"></div>
+            <div class="faint" style="line-height:1.65">
+              三态滞回（≥{params.scoreHigh} 进 risk-on · ≤{params.scoreLow} 进 risk-off · 极态回落需越过 {release.toFixed(2)}）
+              让引擎在阈值附近<b>不来回摇摆</b>；{switches} 次切换覆盖 {regimePoints.length.toLocaleString()} 个交易日，平均每次持有
+              <b class="mono"> {(regimePoints.length / Math.max(1, switches)).toFixed(0)}</b> 天 —— 低换手是设计出来的，不是运气。
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid g-21" style="margin-top:12px">
+        <div class="panel">
+          <div class="panel-hd"><h2>四信号百分位时间线</h2><span class="hint">0.6 / 0.4 是极值参考线，非切换阈值（阈值看综合分）</span></div>
+          <div class="panel-bd"><SignalChart client:load points={regimePoints.map((p) => ({ date: p.date, signals: p.signals }))} /></div>
+        </div>
+        <div class="panel">
+          <div class="panel-hd"><h2>策略参数</h2><span class="hint">config/strategy.json · 单一事实源</span></div>
+          <div class="panel-bd flush">
+            <table class="tbl">
+              <tbody>
+                <tr><td class="l t dim">信号权重</td><td class="t">流动性 {params.weights?.liquidity} · 波动率 {params.weights?.volatility} · 利率 {params.weights?.rates} · 趋势 {params.weights?.trend}</td></tr>
+                <tr><td class="l t dim">切换阈值</td><td class="t">≥{params.scoreHigh} / ≤{params.scoreLow} / 回落 {release.toFixed(2)}</td></tr>
+                <tr><td class="l t dim">目标仓位</td><td class="t">{fmtRatio(params.allocation?.riskOn)} / {fmtRatio(params.allocation?.neutral)} / {fmtRatio(params.allocation?.riskOff)}</td></tr>
+                <tr><td class="l t dim">漂移阈值</td><td class="t">±{params.driftThresholdPp}pp</td></tr>
+                <tr><td class="l t dim">定投</td><td class="t">{fmtUsd(params.dcaUsdt ?? 0)} / 周五</td></tr>
+                <tr><td class="l t dim">财报引擎</td><td class="t">回测关闭（历史财报日不可回溯）· 执行器内生效</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="panel-bd" style="padding-top:0">
+            <div class="faint">期末权重 {weightRows.map(([t, w]) => `${t} ${(w * 100).toFixed(1)}%`).join(" · ")}</div>
+          </div>
+        </div>
+      </div>
+    </>
+  ) : (
+    <div class="panel">
+      <div class="empty">还没有回测结果 —— 运行 <code>npm run backtest</code> 后由 <code>npm run upload</code> 写入 backtest_runs</div>
     </div>
-  </div>
+  )}
 </Base>

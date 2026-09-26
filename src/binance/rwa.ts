@@ -210,8 +210,10 @@ export class RwaApi {
   }
 
   /**
-   * K 线。实测 period 参数被忽略，返回恒定 1 分钟粒度；且 open/high/low/close 四值常相等
-   * （价格源就是上面那个净值标记），所以它不适合画行情，只适合证明"有这条数据"。
+   * K 线。实测 `period` 被忽略、恒定 1 分钟粒度，最多 300 根，volume 恒为 0。
+   * 但 D3 当时写的"OHLC 四值常相等"说重了：300 根里有 84 组不同的开高低收，盘中区间是真的，
+   * 只是它没有量、也翻不出历史（要区间+可回溯走公共 wallet-direct 的 `token/kline/ai`，
+   * 要带量的分钟蜡烛走 `/dex/market/candles`，取舍见 `src/binance/candles.ts` 头注）。
    */
   kline(address: string, params?: { chainId?: string; period?: string; limit?: number }): Promise<RwaKline[]> {
     return this.client.get<RwaKline[]>("/api/v1/dex/market/rwa/kline", {

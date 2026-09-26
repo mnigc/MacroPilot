@@ -1,6 +1,7 @@
 import { Pool } from "pg";
 import type { Point } from "../data/stats.js";
 import type { PremiumRow } from "../binance/premium.js";
+import type { CandleRow, TickRow } from "../binance/candles.js";
 import { joinDrivers, type TradeDriver } from "../strategy/drivers.js";
 
 /**
@@ -66,6 +67,9 @@ export async function initSchema(): Promise<void> {
     );
     -- 已有旧表的增量迁移（幂等）
     alter table trades add column if not exists run_id integer;
+    -- paper 成交所用的链上溢价（null = 该轮无快照或 live 真实成交）。没有这一列就无法事后回答
+    -- "账面比回测少的那截，到底是溢价还是滑点"
+    alter table trades add column if not exists premium double precision;
     create table if not exists portfolio_state (
       mode text not null,
       ticker text not null,
@@ -102,7 +106,60 @@ export async function initSchema(): Promise<void> {
       dex text,
       primary key (captured_at, ticker)
     );
+    -- 链上日线（公共 wallet-direct K 线）。与 rwa_premiums 的分工：询价只给"当下能不能成交"，
+    -- 这张表给可回溯的价格序列（1d 口径约一年）。它没有成交量，所以只能画趋势不能当成交依据。
+    -- 价格是**每枚代币**口径，要与美股每股参考价比必须除以 share_ratio；份额比逐日漂移，
+    -- 所以把采集当时用到的比值一起存，历史溢价才能事后复算而不被后来的漂移污染。
+    create table if not exists rwa_candles (
+      ticker text not null,
+      date date not null,
+      open double precision not null,
+      high double precision not null,
+      low double precision not null,
+      close double precision not null,
+      share_ratio double precision not null default 1,
+      captured_at timestamptz not null default now(),
+      primary key (ticker, date)
+    );
+    -- 带成交量的 1 分钟蜡烛（签名 /dex/market/candles），源站最多给 300 根 ≈ 最近 5~6 小时。
+    -- 粒度固定 1 分钟、limit 只决定根数，所以列里存的是每根 bar 自己的 open_time，
+    -- 而缺掉的那些分钟就是"该分钟一笔成交都没有"——空洞率本身就是流动性读数。
+    -- 它不参与溢价计算（没有对应的美股分钟价），只回答另一个问题：链上到底有没有人在真买卖，
+    -- 还是只有一串净值标记 —— 顺带还给出"多少分钟一笔成交都没有"这个流动性读数。
+    create table if not exists rwa_ticks (
+      ticker text not null,
+      open_time bigint not null,
+      open double precision not null,
+      high double precision not null,
+      low double precision not null,
+      close double precision not null,
+      volume double precision not null default 0,
+      share_ratio double precision not null default 1,
+      captured_at timestamptz not null default now(),
+      primary key (ticker, open_time)
+    );
   `);
+}
+
+/**
+ * 按 ticker 取某日之后的美股日线收盘：ticker → (YYYY-MM-DD → close)。
+ *
+ * `since` 是必需的，不是优化：prices 里有 2000 年至今的全史，不带日期条件时单次要拉四万多行，
+ * 在这条高延迟连接上会撞服务端 statement timeout（code 57014）。实测过一遍。
+ */
+export async function usClosesByTicker(tickers: string[], since: string): Promise<Map<string, Map<string, number>>> {
+  const { rows } = await getPool().query<{ ticker: string; d: string; close: number }>(
+    `select ticker, to_char(date, 'YYYY-MM-DD') as d, close from prices
+     where ticker = any($1) and date >= $2::date`,
+    [tickers, since],
+  );
+  const out = new Map<string, Map<string, number>>();
+  for (const r of rows) {
+    let m = out.get(r.ticker);
+    if (!m) out.set(r.ticker, (m = new Map()));
+    m.set(r.d, r.close);
+  }
+  return out;
 }
 
 export async function loadPricesFromDb(): Promise<Map<string, Point[]>> {
@@ -241,6 +298,29 @@ export async function latestPrices(tickers: string[]): Promise<Map<string, numbe
   return new Map(rows.map((r) => [r.ticker, r.close]));
 }
 
+/**
+ * 最近一轮链上可成交溢价。取"全局最新 captured_at"而不是每只标的各自的最新一行：
+ * 混用相隔数天的报价会让同一轮的成交基准彼此不可比，而摩擦这个口径正要求同一把尺。
+ * 溢价缺失（询价失败）的标的被略去，由调用方按 0 处理。
+ *
+ * 48 小时是硬截止：溢价采集只在用户本机跑（币安拦托管 runner 的出口 IP），关机过周末
+ * 就会留下旧快照。旧溢价 × 新收盘价的混合比"没有溢价"更容易骗人，所以宁可退回参考价。
+ */
+export async function latestPremiums(
+  tickers: string[],
+): Promise<{ capturedAt: string | null; premiums: Map<string, number> }> {
+  const { rows } = await getPool().query<{ t: string; ticker: string; premium: number | null }>(
+    `select captured_at::text as t, ticker, premium from rwa_premiums
+     where captured_at = (
+       select max(captured_at) from rwa_premiums where captured_at > now() - interval '48 hours'
+     ) and ticker = any($1)`,
+    [tickers],
+  );
+  const premiums = new Map<string, number>();
+  for (const r of rows) if (r.premium !== null) premiums.set(r.ticker, r.premium);
+  return { capturedAt: rows[0]?.t ?? null, premiums };
+}
+
 export async function upsertEarningsDates(rows: { ticker: string; date: string }[]): Promise<void> {
   if (!rows.length) return;
   const db = getPool();
@@ -254,6 +334,24 @@ export async function upsertEarningsDates(rows: { ticker: string; date: string }
      on conflict (ticker, earnings_date) do nothing`,
     values,
   );
+}
+
+/**
+ * 财报日历覆盖情况。空表与"有历史但没有未来日期"是两种不同故障：
+ * 前者引擎从未拿到数据，后者引擎会永远判定"无临近财报"。两者都必须能被前端区分展示。
+ */
+export async function earningsCalendarStatus(
+  tickers: string[],
+): Promise<{ rows: number; latest: string | null; upcoming: number }> {
+  const { rows } = await getPool().query<{ n: string; latest: string | null; upcoming: string }>(
+    `select count(*)::text as n,
+            max(earnings_date)::text as latest,
+            count(*) filter (where earnings_date >= current_date)::text as upcoming
+     from earnings_dates where ticker = any($1)`,
+    [tickers],
+  );
+  const r = rows[0];
+  return { rows: Number(r?.n ?? 0), latest: r?.latest ?? null, upcoming: Number(r?.upcoming ?? 0) };
 }
 
 /** 指定日期之后（含当天）的财报日，按标的分组（to_char 避免 TZ 偏移） */
@@ -274,12 +372,19 @@ export async function upcomingEarnings(tickers: string[], asOf: string): Promise
 
 export async function recordTrades(
   mode: string,
-  trades: { date: string; ticker: string; unitsDelta: number; notionalUsdt: number; drivers: TradeDriver[] }[],
+  trades: {
+    date: string;
+    ticker: string;
+    unitsDelta: number;
+    notionalUsdt: number;
+    drivers: TradeDriver[];
+    premium?: number | null;
+  }[],
 ): Promise<void> {
   for (const t of trades) {
     await getPool().query(
-      "insert into trades (mode, date, ticker, units_delta, notional_usdt, reason) values ($1, $2, $3, $4, $5, $6)",
-      [mode, t.date, t.ticker, t.unitsDelta, t.notionalUsdt, joinDrivers(t.drivers)],
+      "insert into trades (mode, date, ticker, units_delta, notional_usdt, reason, premium) values ($1, $2, $3, $4, $5, $6, $7)",
+      [mode, t.date, t.ticker, t.unitsDelta, t.notionalUsdt, joinDrivers(t.drivers), t.premium ?? null],
     );
   }
 }
@@ -311,6 +416,62 @@ export async function saveRuntimeState(mode: string, state: RuntimeState): Promi
        score = excluded.score, as_of = excluded.as_of, updated_at = now()`,
     [mode, state.regime, state.equityTarget, state.score, state.asOf],
   );
+}
+
+/**
+ * 链上日线入库。一次 300 根、7 只标的 = 2100 行，逐行 insert 会把往返放大 2100 倍，
+ * 所以拼成单条多值 upsert；重跑覆盖同一天，采集时间随批次刷新。
+ */
+export async function saveCandles(rows: CandleRow[]): Promise<number> {
+  if (!rows.length) return 0;
+  const db = getPool();
+  const values: unknown[] = [];
+  const tuples = rows.map((r, i) => {
+    values.push(r.ticker, r.date, r.open, r.high, r.low, r.close, r.shareRatio);
+    return `($${i * 7 + 1}, $${i * 7 + 2}, $${i * 7 + 3}, $${i * 7 + 4}, $${i * 7 + 5}, $${i * 7 + 6}, $${i * 7 + 7})`;
+  });
+  const res = await db.query(
+    `insert into rwa_candles (ticker, date, open, high, low, close, share_ratio) values ${tuples.join(",")}
+     on conflict (ticker, date) do update set open = excluded.open, high = excluded.high,
+       low = excluded.low, close = excluded.close, share_ratio = excluded.share_ratio, captured_at = now()`,
+    values,
+  );
+  return res.rowCount ?? 0;
+}
+
+/**
+ * 1 分钟蜡烛入库。该端点只给"最近 300 根"、翻不出历史，所以这张表的定位是"最近一轮采集的镜像"：
+ * 先按 ticker 清掉上一轮再写本轮，否则窗口滑走后旧 bar 会长留在表里，
+ * 图上出现两段互不重叠的时间轴。删除与插入放进一个事务，中途失败不会留下半张表。
+ */
+export async function saveTicks(rows: TickRow[]): Promise<number> {
+  if (!rows.length) return 0;
+  const client = await getPool().connect();
+  try {
+    await client.query("begin");
+    await client.query("delete from rwa_ticks where ticker = any($1)", [
+      Array.from(new Set(rows.map((r) => r.ticker))),
+    ]);
+    const values: unknown[] = [];
+    const tuples = rows.map((r, i) => {
+      values.push(r.ticker, r.openTime, r.open, r.high, r.low, r.close, r.volume, r.shareRatio);
+      return `($${i * 8 + 1}, $${i * 8 + 2}, $${i * 8 + 3}, $${i * 8 + 4}, $${i * 8 + 5}, $${i * 8 + 6}, $${i * 8 + 7}, $${i * 8 + 8})`;
+    });
+    await client.query(
+      `insert into rwa_ticks (ticker, open_time, open, high, low, close, volume, share_ratio) values ${tuples.join(",")}
+       on conflict (ticker, open_time) do update set open = excluded.open, high = excluded.high,
+         low = excluded.low, close = excluded.close, volume = excluded.volume,
+         share_ratio = excluded.share_ratio, captured_at = now()`,
+      values,
+    );
+    await client.query("commit");
+    return rows.length;
+  } catch (e) {
+    await client.query("rollback").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 /** 一轮溢价快照：同一 captured_at 下每个 ticker 一行（采集时刻由调用方决定，便于事后对齐） */

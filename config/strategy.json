@@ -34,12 +34,12 @@
       "thresholdPp": 5
     },
     "earnings": {
-      "$comment": "财报引擎：财报日前 N 天将该股权重乘以 scale，财报后 restoreDays 天恢复。财报日数据源：优先 RWA underlying-profile，否则 yfinance 走 GitHub Actions 同步",
+      "$comment": "财报引擎：财报日前 N 天将该股权重乘以 scale，财报后 restoreDays 天恢复。数据源只有 yfinance（GitHub Actions 同步到 data/earnings）——2026-09-26 实测币安 RWA 端点不提供财报日历：underlying-profile 只有 protections/companyInfo，underlying-market 只有 dividendYield/latestDividend，/rwa/earnings 等 5 个猜测路径全部 404。日历为空时本引擎静默不触发，故 scripts/sync-prices.py 在 --earnings-only 下同步不到就非零退出。",
       "enabled": true,
       "riskOffDaysBefore": 2,
       "scaleFactor": 0.5,
       "restoreDaysAfter": 1,
-      "dataSource": "auto"
+      "dataSource": "yfinance"
     }
   },
   "sleeves": {

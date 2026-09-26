@@ -4,6 +4,7 @@ import type { TradeDriver } from "../strategy/drivers.js";
 import {
   initSchema,
   latestPrices,
+  latestPremiums,
   loadPortfolio,
   loadRuntimeState,
   recordTrades,
@@ -20,8 +21,11 @@ import type { Point } from "../data/stats.js";
 /**
  * 执行器：四引擎（定投/体制/漂移/财报）→ 一张目标权重表 → 与当前组合求差额 → 交易。
  *
- * paper 模式以 DB 中最近同步的收盘价成交，并按 slippagePercent 计提成本（与回测同一套
- * 现金约束）；live 模式把每笔差额交给 trader（RFQ 链路，见 src/exec/live.ts）。
+ * paper 的成交价 = 最近同步收盘价 × (1 + 链上可成交溢价)：钱确实按链上价付出去，持仓却仍按
+ * 收盘参考价估值。两者之差就是"在链上买美股的真实摩擦"，它会原样留在净值曲线里，
+ * 而不是被折进 slippagePercent 那个笼统的执行成本假设。目标权重与漂移仍按参考价计算，
+ * 因此四引擎的决策与回测（run #14）完全可比，差异只出现在成交执行这一层。
+ * live 模式把每笔差额交给 trader（RFQ 链路，见 src/exec/live.ts），真实成交价里本就含溢价。
  * 财报引擎只在执行器生效：历史财报日无法免费回溯 6.5 年，回测中关闭。
  */
 
@@ -50,10 +54,22 @@ export interface ExecutionSummary {
   asOf: string;
   regime: RegimePoint;
   prices: Map<string, number>;
+  /** 本轮采用的溢价快照时刻；null = 表里没有可用快照，成交退化为纯参考价 */
+  premiumAsOf: string | null;
+  premiums: Map<string, number>;
   portfolioBefore: { cash: number; positions: Map<string, number> };
   equityBefore: number;
   targetWeights: Record<string, number>;
-  trades: { date: string; ticker: string; unitsDelta: number; notionalUsdt: number; drivers: TradeDriver[]; txHash?: string }[];
+  trades: {
+    date: string;
+    ticker: string;
+    unitsDelta: number;
+    notionalUsdt: number;
+    drivers: TradeDriver[];
+    txHash?: string;
+    /** 这笔成交计入了多少溢价；live 成交由真实报价决定，记 null */
+    premium: number | null;
+  }[];
   equityAfter: number;
   earningsAffected: string[];
 }
@@ -83,6 +99,7 @@ async function importEarningsCsvs(): Promise<number> {
 
 export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   if (cfg.mode === "live" && !cfg.trader) throw new Error("live 模式必须提供 trader（见 src/exec/live.ts）");
+  const isLive = cfg.mode === "live";
   const feeRate = cfg.slippagePercent / 100;
   await initSchema();
   const importedEarnings = await importEarningsCsvs();
@@ -102,6 +119,9 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   for (const t of cfg.tickers) {
     if (!prices.get(t)) throw new Error(`缺少 ${t} 的最新价格——先运行 GitHub Actions 同步或 python scripts/sync-prices.py`);
   }
+  // 模拟成交（paper，以及任何试运行用的 mode）按"收盘价 × (1+溢价)"计价；
+  // live 的成交价来自真实报价，溢价本就含在里面
+  const snapshot = !isLive ? await latestPremiums(cfg.tickers) : { capturedAt: null, premiums: new Map<string, number>() };
   const { positions, cash } = await loadPortfolio(cfg.mode);
   let workingCash = cash;
   let seeded = false;
@@ -111,6 +131,8 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   }
 
   const priceOf = (t: string): number => prices.get(t) as number;
+  /** 本轮的真实付出/所得单价：参考价之上叠加链上溢价 */
+  const execPriceOf = (t: string): number => priceOf(t) * (1 + (snapshot.premiums.get(t) ?? 0));
   const equityOf = (p: Map<string, number>, c: number): number => {
     let v = c;
     for (const [t, u] of p) v += u * priceOf(t);
@@ -162,6 +184,8 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
       asOf,
       regime: regimePoint,
       prices,
+      premiumAsOf: snapshot.capturedAt,
+      premiums: snapshot.premiums,
       portfolioBefore: { cash, positions },
       equityBefore: 0,
       targetWeights,
@@ -178,6 +202,9 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     return (w - (targetWeights[t] ?? 0)) * 100;
   };
   const drifted = new Set(cfg.tickers.filter((t) => Math.abs(driftOf(t)) > cfg.driftThresholdPp));
+  // 首轮建仓的空仓会让每只标的"偏离"满额目标权重，那是建仓的必然结果而非漂移引擎的
+  // 独立判断——同时记两个驱动等于把同一件事归因两次。
+  if (seeded) drifted.clear();
 
   // 批次级驱动：一笔调仓可由多个引擎同时触发，归因必须全部记录
   const batchDrivers: TradeDriver[] = [];
@@ -190,9 +217,11 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   if (batchDrivers.length) {
     const plan = cfg.tickers.map((t) => {
       const px = priceOf(t);
+      const exec = execPriceOf(t);
       const targetUnits = (equityBefore * (targetWeights[t] ?? 0)) / px;
       const delta = targetUnits - (positions.get(t) ?? 0);
-      return { t, px, delta, notional: Math.abs(delta) * px };
+      // 目标股数仍按参考价求（决策口径与回测一致），名义额按链上有效价结算（执行口径）
+      return { t, exec, delta, notional: Math.abs(delta) * exec };
     });
     const driversFor = (t: string): TradeDriver[] => [
       ...batchDrivers,
@@ -200,34 +229,36 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     ];
 
     // 先卖后买：卖出释放的现金可立即用于买入；买入受可用现金硬约束（含成本），杜绝负现金
-    const execute = async (p: { t: string; px: number; delta: number; notional: number }, buying: boolean) => {
+    const execute = async (p: { t: string; exec: number; delta: number; notional: number }, buying: boolean) => {
+      // live 的 snapshot.premiums 恒为空（真实报价里已含溢价），所以这一项天然只在 paper 有值
+      const prem = snapshot.premiums.get(p.t) ?? null;
       if (buying) {
         const notional = Math.min(p.notional, workingCash / (1 + feeRate));
         if (notional * (1 + feeRate) < cfg.minTradeUsdt) return;
-        const delta = notional / p.px;
-        if (cfg.mode === "live") {
+        const delta = notional / p.exec;
+        if (isLive) {
           const fill = await cfg.trader!.fill({ ticker: p.t, side: "buy", notionalUsdt: notional });
           workingCash -= fill.units * fill.price * (1 + feeRate);
           positions.set(p.t, (positions.get(p.t) ?? 0) + fill.units);
-          trades.push({ date: asOf, ticker: p.t, unitsDelta: fill.units, notionalUsdt: fill.units * fill.price, drivers: driversFor(p.t), txHash: fill.txHash });
+          trades.push({ date: asOf, ticker: p.t, unitsDelta: fill.units, notionalUsdt: fill.units * fill.price, drivers: driversFor(p.t), txHash: fill.txHash, premium: null });
           return;
         }
         workingCash -= notional * (1 + feeRate);
         positions.set(p.t, (positions.get(p.t) ?? 0) + delta);
-        trades.push({ date: asOf, ticker: p.t, unitsDelta: delta, notionalUsdt: notional, drivers: driversFor(p.t) });
+        trades.push({ date: asOf, ticker: p.t, unitsDelta: delta, notionalUsdt: notional, drivers: driversFor(p.t), premium: prem });
         return;
       }
       if (p.notional < cfg.minTradeUsdt) return;
-      if (cfg.mode === "live") {
+      if (isLive) {
         const fill = await cfg.trader!.fill({ ticker: p.t, side: "sell", notionalUsdt: p.notional });
         workingCash += fill.units * fill.price * (1 - feeRate);
         positions.set(p.t, (positions.get(p.t) ?? 0) - fill.units);
-        trades.push({ date: asOf, ticker: p.t, unitsDelta: -fill.units, notionalUsdt: fill.units * fill.price, drivers: driversFor(p.t), txHash: fill.txHash });
+        trades.push({ date: asOf, ticker: p.t, unitsDelta: -fill.units, notionalUsdt: fill.units * fill.price, drivers: driversFor(p.t), txHash: fill.txHash, premium: null });
         return;
       }
       workingCash += p.notional * (1 - feeRate);
       positions.set(p.t, (positions.get(p.t) ?? 0) + p.delta);
-      trades.push({ date: asOf, ticker: p.t, unitsDelta: p.delta, notionalUsdt: p.notional, drivers: driversFor(p.t) });
+      trades.push({ date: asOf, ticker: p.t, unitsDelta: p.delta, notionalUsdt: p.notional, drivers: driversFor(p.t), premium: prem });
     };
 
     for (const p of plan.filter((x) => x.delta < 0)) await execute(p, false);
@@ -243,6 +274,8 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     asOf,
     regime: regimePoint,
     prices,
+    premiumAsOf: snapshot.capturedAt,
+    premiums: snapshot.premiums,
     portfolioBefore: { cash, positions },
     equityBefore,
     targetWeights,

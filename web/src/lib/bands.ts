@@ -26,9 +26,9 @@ export function regimeBands(dates: string[], regimes: string[]): Band[] {
 }
 
 export const REGIME_COLOR: Record<string, string> = {
-  riskOn: "rgba(46, 189, 133, 0.09)",
-  neutral: "rgba(91, 141, 239, 0.08)",
-  riskOff: "rgba(246, 70, 93, 0.10)",
+  riskOn: "rgba(14, 203, 129, 0.07)",
+  neutral: "rgba(75, 155, 255, 0.055)",
+  riskOff: "rgba(246, 70, 93, 0.085)",
 };
 
 export const REGIME_LABEL: Record<string, string> = {

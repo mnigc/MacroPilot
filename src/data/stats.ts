@@ -79,3 +79,24 @@ export function parseFredCsv(csv: string): Point[] {
   }
   return out;
 }
+
+/**
+ * 股价 CSV 有两种表头：老的 date,value，和 sync-prices.py 现行的
+ * date,open,high,low,close。回测只认 close，所以按列名定位而不是按位置——
+ * 否则换了表头会静默拿 open 当 close 跑回测。
+ */
+export function parsePriceCsv(csv: string): Point[] {
+  const lines = csv.trim().split(/\r?\n/);
+  const head = (lines[0] ?? "").split(",").map((s) => s.trim().toLowerCase());
+  const di = Math.max(0, head.indexOf("date"));
+  const ci = head.includes("close") ? head.indexOf("close") : head.indexOf("value");
+  const out: Point[] = [];
+  if (ci < 0) return out;
+  for (let i = 1; i < lines.length; i++) {
+    const cols = (lines[i] ?? "").split(",");
+    const date = cols[di];
+    const value = Number(cols[ci]);
+    if (date && Number.isFinite(value)) out.push({ date, value });
+  }
+  return out;
+}

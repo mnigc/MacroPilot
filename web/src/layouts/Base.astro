@@ -1,12 +1,43 @@
 ---
 import "../styles/global.css";
-const { active = "", title = "MacroPilot · 代币化股票智能投顾" } = Astro.props;
+import { getLatestRun, getFreshness, getTickerBoard } from "../lib/db";
+
+const { active = "", crumb = "", sub = "", title = "MacroPilot · 代币化股票智能投顾" } = Astro.props;
+
+const run = await getLatestRun();
+const tickers: string[] = run?.tickers ?? [];
+const [board, fresh] = await Promise.all([getTickerBoard(tickers), getFreshness()]);
+
 const items = [
-  { href: "/", label: "仪表盘", key: "dash" },
-  { href: "/backtest", label: "回测", key: "backtest" },
-  { href: "/trades", label: "交易记录", key: "trades" },
-  { href: "/spread", label: "链上溢价", key: "spread" },
+  {
+    href: "/", key: "dash", label: "投顾仪表盘",
+    icon: '<path d="M3 3h7v7H3zM14 3h7v4h-7zM14 10h7v11h-7zM3 13h7v8H3z"/>',
+  },
+  {
+    href: "/backtest", key: "backtest", label: "回测实验室",
+    icon: '<path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-7"/>',
+  },
+  {
+    href: "/trades", key: "trades", label: "交易流水",
+    icon: '<path d="M4 6h16M4 12h16M4 18h10"/><circle cx="19" cy="18" r="1.4"/>',
+  },
+  {
+    href: `/ticker/${tickers[0] ?? "AAPL"}`, key: "ticker", label: "标的走势",
+    icon: '<path d="M3 20.5h18"/><path d="M8 3.5v3M8 16.5v3M5.8 6.5h4.4v10H5.8z"/><path d="M16.5 8v2.5M16.5 16.5v2M14.3 10.5h4.4v6h-4.4z"/>',
+  },
+  {
+    href: "/spread", key: "spread", label: "链上溢价",
+    icon: '<path d="M12 3v18M5 7l-3 6h6zM19 7l-3 6h6zM5 7 12 5l7 2"/><path d="M8 21h8"/>',
+  },
 ];
+
+const chgPct = (c: number, p: number | null) => (p ? c / p - 1 : null);
+const fmtPct = (v: number, d = 2) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(d)}%`;
+
+/** 滞后超过 4 天的源要显式标黄——"永不停歇"必须能被证伪 */
+const lagDays = (asOf: string | null) => (asOf ? Math.floor((Date.now() - Date.parse(asOf + "T23:59:59Z")) / 86_400_000) : 999);
+const premiumAge = fresh.premium.capturedAt ? Math.floor((Date.now() - Date.parse(fresh.premium.capturedAt)) / 3_600_000) : 999;
+const premiumState = premiumAge > 30 ? "bad" : premiumAge > 6 ? "warn" : "ok";
 ---
 <!doctype html>
 <html lang="zh-CN">
@@ -14,23 +45,118 @@ const items = [
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{title}</title>
+    <meta name="description" content="MacroPilot — 宏观体制驱动的代币化股票链上智能投顾，BNB Hack 参赛作品" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   </head>
   <body>
-    <nav class="nav">
-      <div class="nav-inner">
-        <a href="/" class="logo">
-          <span class="mark">◆</span>
-          MacroPilot<small>BNB Hack · 代币化股票专题</small>
-        </a>
-        {items.map((it) => <a href={it.href} class:list={["item", { active: active === it.key }]}>{it.label}</a>)}
-      </div>
-    </nav>
-    <div class="container">
-      <slot />
-      <div class="footer">
-        <span>MacroPilot — 定投 · 体制 · 漂移 · 财报，四引擎共享一个链上执行器</span>
-        <span>纸面数据，不构成投资建议 · <a href="https://github.com/mnigc/macro-bnbchain" style="color:var(--text-2)">GitHub</a></span>
+    <div class="app">
+      <aside class="side">
+        <div class="brand">
+          <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true">
+            <defs>
+              <linearGradient id="bm-gold" x1="6" y1="2" x2="58" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#FDE04B"/><stop offset="0.55" stop-color="#FCD535"/><stop offset="1" stop-color="#E8A600"/>
+              </linearGradient>
+            </defs>
+            <rect width="64" height="64" rx="15" fill="url(#bm-gold)"/>
+            <path d="M12.5 47.5 25 27 35 38.5 48 23" fill="none" stroke="#0A0C10" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M55.4 14.2 54.3 28.3 41.7 17.7Z" fill="#0A0C10"/>
+          </svg>
+          <span class="brand-txt">MacroPilot<small>BNB HACK · 代币化股票</small></span>
+        </div>
+
+        <nav class="nav-group">
+          <div class="nav-cap">策略</div>
+          {items.map((it) => (
+            <a href={it.href} class:list={["nav-item", { active: active === it.key }]}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" set:html={it.icon} />
+              {it.label}
+            </a>
+          ))}
+        </nav>
+
+        <div class="side-foot">
+          <div class="kv"><span class="k">执行模式</span><span class="v"><b class="yel">{fresh.agent.mode ?? "paper"}</b></span></div>
+          <div class="kv"><span class="k">执行器</span><span class="v">{fresh.agent.asOf ?? "未运行"}</span></div>
+          <div class="kv"><span class="k">股价</span><span class:list={["v", lagDays(fresh.prices.asOf) > 4 && "down"]}>{fresh.prices.asOf ?? "—"}</span></div>
+          <div class="kv"><span class="k">宏观</span><span class="v">{fresh.macro.asOf ?? "—"}</span></div>
+          <div class="kv"><span class="k">溢价</span><span class:list={["chip", premiumState]}>{premiumAge > 48 ? `${Math.floor(premiumAge / 24)} 天前` : premiumAge >= 1 ? `${premiumAge} 小时前` : "刚刚"}</span></div>
+        </div>
+      </aside>
+
+      <div class="main">
+        <header class="topbar">
+          <div class="topbar-in">
+            <div class="crumb">
+              <h1>{crumb}</h1>
+              <span class="sub">{sub}</span>
+            </div>
+            <div class="topbar-r">
+              <slot name="actions" />
+            </div>
+          </div>
+          {board.length > 0 && (
+            <div class="strip" data-marquee="off">
+              {[[0, false], [1, true]].map(([pass, hidden]) => (
+                <div class="strip-track" aria-hidden={hidden ? "true" : undefined}>
+                  {board.map((b) => {
+                    const ch = chgPct(b.close, b.prevClose);
+                    return (
+                      <a class="strip-item" href={`/ticker/${b.ticker}`}>
+                        <span class="s">{b.ticker}</span>
+                        <span class="p">{b.close.toFixed(2)}</span>
+                        <span class:list={["d", ch === null ? "dim" : ch >= 0 ? "up" : "down"]}>{ch === null ? "—" : fmtPct(ch)}</span>
+                        {b.premium !== null && (
+                          <span class="p dim" title={`链上可成交溢价 · ${b.symbol ?? ""}`}>
+                            溢价 <b class={b.premium >= 0 ? "down" : "up"}>{fmtPct(b.premium, 3)}</b>
+                          </span>
+                        )}
+                      </a>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          )}
+        </header>
+
+        <main class="content">
+          <slot />
+          <div class="foot">
+            <span>MacroPilot — 定投 · 体制 · 漂移 · 财报，四引擎共享一个链上执行器 · 回测 run #{run?.id ?? "—"}</span>
+            <span>纸面数据，不构成投资建议 · <a href="https://github.com/mnigc/macro-bnbchain" class="dim" style="text-decoration:underline">GitHub</a></span>
+          </div>
+        </main>
       </div>
     </div>
+    <script>
+      /**
+       * 行情条 marquee：单轮宽度不足视口时右侧会露白，所以先把条目补齐到 ≥1.5 轮，
+       * 再按固定像素速度换算动画时长——两条 track 各位移自身宽度的 100% 即无缝循环。
+       */
+      const strip = document.querySelector<HTMLElement>(".strip[data-marquee]");
+      const tracks = strip ? Array.from(strip.querySelectorAll<HTMLElement>(".strip-track")) : [];
+      if (strip && tracks.length === 2) {
+        const [head, tail] = tracks;
+        const proto = Array.from(head.children) as HTMLElement[];
+        const addOnce = () => {
+          for (const src of [...proto]) {
+            for (const track of tracks) {
+              const c = src.cloneNode(true) as HTMLElement;
+              c.setAttribute("aria-hidden", "true");
+              c.setAttribute("tabindex", "-1");
+              track.appendChild(c);
+            }
+          }
+        };
+        let guard = 0;
+        while (head.scrollWidth < strip.clientWidth * 1.5 && guard++ < 8) addOnce();
+        if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+          strip.style.setProperty("--strip-dur", `${Math.max(28, head.scrollWidth / 42).toFixed(1)}s`);
+          strip.dataset.marquee = "on";
+        }
+      }
+    </script>
   </body>
 </html>

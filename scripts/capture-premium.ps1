@@ -14,6 +14,11 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 npm run spread
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# 链上日线：公共 wallet-direct 端点一次给 300 根，重跑即覆盖当天，所以它既是每日积累也是自愈
+# ——哪天机器没开机，第二天补回来，历史不会缺洞。
+npm run candles
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 # 站点是构建期读库的静态产物，写完库要 push 一次才能刷新页面。
 # 时间戳文件同时充当线上数据新鲜度的公开凭据（https://…/last-run.txt）。
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')

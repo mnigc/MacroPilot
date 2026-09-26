@@ -5,7 +5,12 @@ name: sync-data
 on:
   schedule:
     - cron: "30 0 * * 2-6" # 周二到周六（UTC，对应美股收盘后）
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      earnings_only:
+        description: "只补财报日历，跳过 6 年股价历史（本地/临时补数据用）"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -19,7 +24,13 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install yfinance pandas
-      - run: python scripts/sync-prices.py
+      - name: sync
+        run: |
+          if [ "${{ github.event.inputs.earnings_only }}" = "true" ]; then
+            python scripts/sync-prices.py --earnings-only
+          else
+            python scripts/sync-prices.py
+          fi
       - name: commit data
         run: |
           git config user.name "data-bot"
