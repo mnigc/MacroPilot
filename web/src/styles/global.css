@@ -235,8 +235,10 @@ button.chip:hover { background: rgba(255, 255, 255, 0.09); color: var(--text); }
 .tbl .rank { display: inline-block; width: 46px; height: 4px; margin-left: 6px; border-radius: 2px; background: rgba(255, 255, 255, 0.09); vertical-align: middle; }
 .tbl .rank b { display: block; height: 100%; border-radius: 2px; background: var(--yellow); }
 
-.up { color: var(--up); }
-.down { color: var(--down); }
+/* 涨跌/买卖的语义色必须压过 .strong/.faint/.dim 的灰白：同特异性下靠后的声明会赢，
+   所以盈亏列一旦套上这些工具类就悄悄变回无色。 */
+.up { color: var(--up) !important; }
+.down { color: var(--down) !important; }
 .yel { color: var(--yellow); }
 .dim { color: var(--text-3); }
 .faint { color: var(--text-4); font-size: 11.5px; }

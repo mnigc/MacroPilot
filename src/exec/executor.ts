@@ -1,5 +1,5 @@
-import { fetchMacroBundle } from "../data/fred.js";
-import { computeRegimeTimeline, type RegimeConfig, type RegimePoint } from "../strategy/regime.js";
+import { fetchMacroBundle, MAX_SERIES_LAG_DAYS } from "../data/fred.js";
+import { computeRegimeTimeline, WARMUP_DAYS, type RegimeConfig, type RegimePoint } from "../strategy/regime.js";
 import type { TradeDriver } from "../strategy/drivers.js";
 import {
   initSchema,
@@ -110,7 +110,15 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   const bundle = await fetchMacroBundle();
   const timeline = computeRegimeTimeline(bundle, cfg.regime);
   const regimePoint = timeline[timeline.length - 1];
-  if (!regimePoint) throw new Error("体制时间线为空：宏观序列数据不足（需 ≥3 年历史）");
+  if (!regimePoint) throw new Error("体制时间线为空：宏观序列数据不足（每路需 ≥3 年历史）");
+  const calendarLag = Math.round(
+    (Date.parse(bundle.trend.at(-1)?.date ?? regimePoint.date) - Date.parse(regimePoint.date)) / 86_400_000,
+  );
+  if (calendarLag > MAX_SERIES_LAG_DAYS) {
+    throw new Error(
+      `体制时间线最新点停在 ${regimePoint.date}，落后 SP500 日历 ${calendarLag} 天——序列重叠不足以填满 ${WARMUP_DAYS} 天预热窗口`,
+    );
+  }
   const prevState = await loadRuntimeState(cfg.mode);
   const regimeChanged = prevState !== null && prevState.equityTarget !== regimePoint.equityTarget;
 

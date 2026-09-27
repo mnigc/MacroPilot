@@ -53,7 +53,7 @@ const RANK_WINDOW = 756; // 百分位回看 3 年
 const CHANGE_LAG = 65; // 变化窗口 ≈ 13 周
 const VOL_TREND_LAG = 20; // VIX 短趋势 ≈ 1 个月
 const SMA_WINDOW = 200; // 长趋势均线
-const WARMUP = RANK_WINDOW + CHANGE_LAG + 1; // 第一个可用信号日
+export const WARMUP_DAYS = RANK_WINDOW + CHANGE_LAG + 1; // 第一个可用信号日
 
 /**
  * 三态滞回（Schmitt 触发）单步：进入极态要越过外沿，回到中性要越过内沿 release。
@@ -136,7 +136,7 @@ export function computeRegimeTimeline(bundle: MacroBundle, cfg: RegimeConfig): R
     const ma = smaAlign[i];
     if (px !== undefined && ma !== undefined && ma !== 0) buf.trendDev.push(px / ma - 1);
 
-    if (i < WARMUP) continue;
+    if (i < WARMUP_DAYS) continue;
 
     const window = <T>(arr: T[]) => arr.slice(Math.max(0, arr.length - RANK_WINDOW));
     const liqNow = buf.liquidity[buf.liquidity.length - 1];

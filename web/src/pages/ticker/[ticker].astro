@@ -180,7 +180,9 @@ const tiles: { k: string; v: string; s: string; c?: string }[] = [
                 <td>{t.price.toFixed(2)}</td>
                 <td class="strong">{fmtUsd(t.notional, 0)}</td>
                 <td class={t.realized === null ? cls(t.ret ?? 0) : cls(t.realized)}>
-                  {t.realized === null ? <span class="faint">{t.ret === null ? "—" : `至今 ${fmtPct(t.ret)}`}</span> : `${fmtSigned(t.realized)} · ${t.ret === null ? "—" : fmtPct(t.ret)}`}
+                  {t.realized === null
+                    ? <>{t.ret === null ? <span class="faint">—</span> : <><span class="faint">至今 </span>{fmtPct(t.ret)}</>}</>
+                    : `${fmtSigned(t.realized)} · ${t.ret === null ? "—" : fmtPct(t.ret)}`}
                 </td>
               </tr>
             ))}
