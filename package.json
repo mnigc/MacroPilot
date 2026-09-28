@@ -10,22 +10,18 @@
     "dev": "npm --prefix web run dev",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "smoke": "tsx scripts/smoke.ts",
-    "spread": "tsx scripts/spread.ts",
-    "candles": "tsx scripts/candles.ts",
-    "reconcile": "tsx scripts/reconcile.ts",
-    "wallet": "tsx scripts/wallet.ts",
-    "wallet:new": "tsx scripts/new-wallet.ts --save",
     "backtest": "tsx scripts/backtest.ts",
+    "sweep": "tsx scripts/sweep.ts",
     "agent": "tsx src/run-once.ts",
+    "agent:dry": "tsx src/run-once.ts --dry-run",
+    "import-real": "tsx scripts/import-real.ts",
+    "import-csv": "tsx scripts/import-csv.ts",
     "web:build": "npm --prefix web run build",
     "preview": "npm --prefix web run preview"
   },
   "dependencies": {
     "dotenv": "^17.2.1",
-    "pg": "^8.23.0",
-    "undici": "^8.11.2",
-    "viem": "^2.32.0"
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

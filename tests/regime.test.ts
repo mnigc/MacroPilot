@@ -130,3 +130,71 @@ describe("体制引擎", () => {
     expect(switches).toBeLessThan(20);
   });
 });
+
+describe("Sahm 确认门", () => {
+  it("3 个月均值较 12 个月低点抬升 ≥0.5pp 时，无论体制档位多高，目标仓位压回 risk-off 档", () => {
+    // 失业率：前 9 个月 3.5，后 4 个月爬到 4.5 → sahm = mean(4.2,4.4,4.5) − 3.5 ≈ 0.87
+    const labor: Point[] = [];
+    for (let i = 0; i < 9; i++) labor.push({ date: `${2020 + Math.floor(i / 12)}-01-0${(i % 9) + 1}`, value: 3.5 });
+    // 用月序号构造可读日期序列（date 仅要求升序唯一）
+    labor.length = 0;
+    const months = (n: number, v: number) => {
+      for (let i = 0; i < n; i++) {
+        const y = 2020 + Math.floor(i / 12);
+        const m = String((i % 12) + 1).padStart(2, "0");
+        labor.push({ date: `${y}-${m}-15`, value: v });
+      }
+    };
+    months(12, 3.5);
+    months(1, 4.2);
+    months(1, 4.4);
+    months(1, 4.5);
+    const b = bundle({ vix: [12, 30] }); // 其余信号恒定
+    b.labor = labor;
+    const gateCfg: RegimeConfig = { ...cfg, gate: { sahmThreshold: 0.5 } };
+    const timeline = computeRegimeTimeline(b, gateCfg);
+    const tail = timeline.slice(-30);
+    expect(tail.length).toBeGreaterThan(0);
+    for (const p of tail) {
+      expect(p.sahm).not.toBeNull();
+      expect(p.sahm as number).toBeGreaterThanOrEqual(0.5);
+      expect(p.gateActive).toBe(true);
+      expect(p.equityTarget).toBeLessThanOrEqual(gateCfg.allocation.riskOff + 1e-12);
+    }
+  });
+
+  it("无失业率序列时门不生效，equityTarget 与体制档位一致（回归：可选序列不得改变既有语义）", () => {
+    const timeline = computeRegimeTimeline(bundle({}), cfg);
+    for (const p of timeline) {
+      expect(p.sahm).toBeNull();
+      expect(p.gateActive).toBe(false);
+      expect(p.equityTarget).toBe(cfg.allocation[p.regime]);
+    }
+  });
+});
+
+describe("信用信号", () => {
+  it("缺失信用序列时信号记中性 0.5，综合分仍由其余信号重归一得出（不塌成 0）", () => {
+    const timeline = computeRegimeTimeline(bundle({}), cfg);
+    expect(timeline.length).toBeGreaterThan(0);
+    for (const p of timeline) {
+      expect(p.signals.credit).toBe(0.5);
+      expect(p.score).toBeGreaterThan(0);
+    }
+  });
+
+  it("信用利差飙升应把综合分往下拉", () => {
+    // 其余信号不变，仅信用利差从 3.0 爬升到 6.0（末段 65 天加速，越过后段百分位极值）
+    const creditCfg: RegimeConfig = { ...cfg, weights: { ...cfg.weights, credit: 0.2 } };
+    const base = computeRegimeTimeline(bundle({}), creditCfg).at(-1)!.score;
+    const n = 1100;
+    const credit: Point[] = [];
+    for (let i = 0; i < n; i++) {
+      credit.push({ date: dateAt(i), value: i < n - 65 ? 3.0 : 3.0 + ((i - (n - 65)) / 65) * 3.0 });
+    }
+    const b = bundle({});
+    b.credit = credit;
+    const stressed = computeRegimeTimeline(b, creditCfg).at(-1)!.score;
+    expect(stressed).toBeLessThan(base);
+  });
+});

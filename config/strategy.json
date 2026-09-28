@@ -1,40 +1,56 @@
 {
-  "$comment": "策略参数：四个策略引擎（定投/体制/漂移/财报）共享一个执行器，输出合成一张目标权重表。所有可调参数集中在此。",
+  "$comment": "策略参数：六个策略模块（定投/体制/波动率目标/估值锚/漂移/财报）共享一个纸面执行器，输出合成一张目标权重表。所有可调参数集中在此。",
   "basket": {
-    "$comment": "目标篮子：等权 Mag7。首次运行时通过 /rwa/search 解析为链上合约地址并缓存到 data/tokens.json",
-    "tickers": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA"],
-    "quoteAsset": {
-      "chainId": 56,
-      "symbol": "USDT",
-      "address": "0x55d398326f99059fF775485246999027B3197955"
-    }
+    "$comment": "目标篮子：当前为等权 Mag7。改这份 ticker 列表即可换标的组合（数据由 scripts/sync-prices.py 从 yfinance 同步）",
+    "tickers": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA"]
   },
   "engines": {
     "dca": {
-      "$comment": "定投引擎：每周五 13:00 UTC（美股盘前）注入新资金，按当期目标权重买入",
+      "$comment": "定投引擎：每周五注入固定金额，按当期目标权重买入",
       "enabled": true,
       "schedule": "weekly-friday-1300Z",
       "amountUsdt": 50
     },
     "regime": {
-      "$comment": "体制引擎（风险内核）：四信号加权 → 综合分。>=scoreHigh risk-on / <=scoreLow risk-off；从极态回到 neutral 需越过 scoreRelease（三态滞回，缺省取两阈值中点）。无 release 边沿时 neutral 只有初始值、离开后永久不可达",
+      "$comment": "体制引擎（内核）：宏观信号百分位加权 → 综合分 → 三态滞回决定总仓位。信号权重之和不必为 1（内部重归一）；某路序列缺失时该信号退出加权而非记 0 分。>=scoreHigh risk-on / <=scoreLow risk-off；从极态回到 neutral 需越过 scoreRelease",
       "scoreHigh": 0.6,
       "scoreLow": 0.3,
       "scoreRelease": 0.45,
       "allocation": { "riskOn": 1.0, "neutral": 0.6, "riskOff": 0.25 },
+      "gate": {
+        "$comment": "Sahm 确认门：失业率 3 个月均值 − 12 个月低点 ≥ 0.5pp（经典衰退阈值）时，权益仓位上限压回 risk-off 档。它不参与加权投票——确认信号被加权会稀释",
+        "sahmThreshold": 0.5
+      },
       "signals": {
-        "liquidity": { "$comment": "美联储资产负债表 13 周变化", "fredSeries": "WALCL", "weight": 0.3 },
-        "volatility": { "$comment": "VIX 水平与趋势", "fredSeries": "VIXCLS", "weight": 0.3 },
-        "rates": { "$comment": "10Y 国债收益率 13 周变化（下行加分）", "fredSeries": "DGS10", "weight": 0.2 },
-        "trend": { "$comment": "标普 500 相对 200 日均线", "fredSeries": "SP500", "weight": 0.2 }
+        "liquidity": { "$comment": "美联储资产负债表 13 周变化", "fredSeries": "WALCL", "weight": 0.24 },
+        "volatility": { "$comment": "VIX 水平 70% + 1 月趋势 30%", "fredSeries": "VIXCLS", "weight": 0.24 },
+        "rates": { "$comment": "10Y 国债收益率 13 周变化（下行加分）", "fredSeries": "DGS10", "weight": 0.16 },
+        "trend": { "$comment": "标普 500 相对 200 日均线", "fredSeries": "SP500", "weight": 0.16 },
+        "credit": { "$comment": "高收益信用利差：水平 70% + 13 周变化 30%（收紧减分）", "fredSeries": "BAMLH0A0HYM2", "weight": 0.2 }
       }
     },
+    "volTarget": {
+      "$comment": "波动率目标叠加：21 日已实现波动高于目标就按比例减仓（不杠杆，ceiling≤1）。它改的是体制档位的乘数，不投票不改状态机",
+      "enabled": true,
+      "targetVol": 0.15,
+      "lookbackDays": 21,
+      "floor": 0.5,
+      "ceiling": 1.0,
+      "triggerPp": 10
+    },
+    "valuation": {
+      "$comment": "估值锚叠加：CAPE 滚动百分位 → ±maxTilt 线性偏移（贵时少买，便宜时多买）。CAPE 月度数据由 scripts/sync-valuation.py 抓 multpl.com 存 data/valuation/cape.csv；文件缺失时本引擎按关闭处理并在站点标注",
+      "enabled": true,
+      "maxTilt": 0.15,
+      "lookbackYears": 20,
+      "triggerPp": 5
+    },
     "drift": {
-      "$comment": "漂移引擎：个股权重偏离目标超过阈值才拉回，避免高频小单磨损手续费",
+      "$comment": "漂移引擎：个股权重偏离目标超过阈值才拉回，避免高频小单磨损费用",
       "thresholdPp": 5
     },
     "earnings": {
-      "$comment": "财报引擎：财报日前 N 天将该股权重乘以 scale，财报后 restoreDays 天恢复。数据源只有 yfinance（GitHub Actions 同步到 data/earnings）——2026-09-26 实测币安 RWA 端点不提供财报日历：underlying-profile 只有 protections/companyInfo，underlying-market 只有 dividendYield/latestDividend，/rwa/earnings 等 5 个猜测路径全部 404。日历为空时本引擎静默不触发，故 scripts/sync-prices.py 在 --earnings-only 下同步不到就非零退出。",
+      "$comment": "财报引擎：财报日前 N 天将该股权重乘以 scale，财报后 restoreDays 天恢复。历史财报日已由 yfinance get_earnings_dates 回填进回测；未来日期由 yfinance 同步（GitHub Actions）。日历为空时本引擎静默不触发，故 scripts/sync-prices.py 在 --earnings-only 下同步不到就非零退出。",
       "enabled": true,
       "riskOffDaysBefore": 2,
       "scaleFactor": 0.5,
@@ -42,17 +58,18 @@
       "dataSource": "yfinance"
     }
   },
-  "sleeves": {
-    "$comment": "资金两筒：股票筒比例由体制引擎决定，其余留稳定币筒。DeFi 收益筒为 stretch goal",
-    "stableSymbol": "USDT",
-    "defiYieldParking": false
-  },
   "execution": {
-    "$comment": "执行护栏：单笔最小 20 USDT 避免灰尘单；报价冲击超过 1% 中止（live）；默认纸面模式。startCashUsdt 为 paper 组合首次运行的初始资金",
-    "minTradeUsdt": 20,
-    "maxPriceImpactPercent": 1.0,
-    "slippagePercent": 0.5,
+    "$comment": "执行护栏：单笔最小 20 美元避免灰尘单；成本逐笔计算（半价差+√冲击，按 ADV20），无成交量数据时退回 slippagePercent。现金按 DGS3MO 日频计息（纸面与基准腿同待遇）。startCashUsdt 为 paper 组合首次运行的初始资金。mode = 账本分区：正常用 paper；要试跑执行器又不污染公开账本时临时改成别的值（如 dry），跑完立刻改回并删掉该分区的行",
     "mode": "paper",
-    "startCashUsdt": 10000
+    "minTradeUsdt": 20,
+    "slippagePercent": 0.5,
+    "cashInterest": true,
+    "startCashUsdt": 10000,
+    "cost": {
+      "$comment": "bps = halfSpreadBps + impactCoef × √(名义额/ADV20) × 10⁴；财报窗口内 × earningsMult",
+      "halfSpreadBps": 3,
+      "impactCoef": 0.35,
+      "earningsMult": 1.5
+    }
   }
 }

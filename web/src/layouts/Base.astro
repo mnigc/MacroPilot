@@ -2,7 +2,7 @@
 import "../styles/global.css";
 import { getLatestRun, getFreshness, getTickerBoard } from "../lib/db";
 
-const { active = "", crumb = "", sub = "", title = "MacroPilot · 代币化股票智能投顾" } = Astro.props;
+const { active = "", crumb = "", sub = "", title = "MacroPilot · 全球股票智能投顾" } = Astro.props;
 
 const run = await getLatestRun();
 const tickers: string[] = run?.tickers ?? [];
@@ -25,10 +25,6 @@ const items = [
     href: `/ticker/${tickers[0] ?? "AAPL"}`, key: "ticker", label: "标的走势",
     icon: '<path d="M3 20.5h18"/><path d="M8 3.5v3M8 16.5v3M5.8 6.5h4.4v10H5.8z"/><path d="M16.5 8v2.5M16.5 16.5v2M14.3 10.5h4.4v6h-4.4z"/>',
   },
-  {
-    href: "/spread", key: "spread", label: "链上溢价",
-    icon: '<path d="M12 3v18M5 7l-3 6h6zM19 7l-3 6h6zM5 7 12 5l7 2"/><path d="M8 21h8"/>',
-  },
 ];
 
 const chgPct = (c: number, p: number | null) => (p ? c / p - 1 : null);
@@ -36,8 +32,20 @@ const fmtPct = (v: number, d = 2) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(d)
 
 /** 滞后超过 4 天的源要显式标黄——"永不停歇"必须能被证伪 */
 const lagDays = (asOf: string | null) => (asOf ? Math.floor((Date.now() - Date.parse(asOf + "T23:59:59Z")) / 86_400_000) : 999);
-const premiumAge = fresh.premium.capturedAt ? Math.floor((Date.now() - Date.parse(fresh.premium.capturedAt)) / 3_600_000) : 999;
-const premiumState = premiumAge > 30 ? "bad" : premiumAge > 6 ? "warn" : "ok";
+/**
+ * 执行器心跳：runtime_state 每轮都会写，所以这个"距今多久"才是"永不停歇"的可核对读数；
+ * 只显示数据日 as_of 会掩盖"守卫拦下、今天根本没跑"这种状态。按日频节拍定阈值：
+ * 超过 30h 说明漏了一轮，超过 54h 说明连着两轮没跑。
+ */
+const execAge = fresh.agent.at ? (Date.now() - Date.parse(fresh.agent.at)) / 3_600_000 : Infinity;
+const execCls = execAge > 54 ? "down" : execAge > 30 ? "yel" : "";
+const execLabel = !fresh.agent.at
+  ? "未运行"
+  : execAge < 1
+    ? `${Math.round(execAge * 60)} 分钟前`
+    : execAge < 48
+      ? `${execAge.toFixed(0)} 小时前`
+      : `${(execAge / 24).toFixed(1)} 天前`;
 ---
 <!doctype html>
 <html lang="zh-CN">
@@ -45,7 +53,7 @@ const premiumState = premiumAge > 30 ? "bad" : premiumAge > 6 ? "warn" : "ok";
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{title}</title>
-    <meta name="description" content="MacroPilot — 宏观体制驱动的代币化股票链上智能投顾，BNB Hack 参赛作品" />
+    <meta name="description" content="MacroPilot — 宏观体制驱动的全球股票投资平台" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   </head>
@@ -63,7 +71,7 @@ const premiumState = premiumAge > 30 ? "bad" : premiumAge > 6 ? "warn" : "ok";
             <path d="M12.5 47.5 25 27 35 38.5 48 23" fill="none" stroke="#0A0C10" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
             <path d="M55.4 14.2 54.3 28.3 41.7 17.7Z" fill="#0A0C10"/>
           </svg>
-          <span class="brand-txt">MacroPilot<small>BNB HACK · 代币化股票</small></span>
+          <span class="brand-txt">MacroPilot<small>全球股票 · 智能投顾</small></span>
         </div>
 
         <nav class="nav-group">
@@ -78,10 +86,9 @@ const premiumState = premiumAge > 30 ? "bad" : premiumAge > 6 ? "warn" : "ok";
 
         <div class="side-foot">
           <div class="kv"><span class="k">执行模式</span><span class="v"><b class="yel">{fresh.agent.mode ?? "paper"}</b></span></div>
-          <div class="kv"><span class="k">执行器</span><span class="v">{fresh.agent.asOf ?? "未运行"}</span></div>
+          <div class="kv"><span class="k">执行器</span><span class:list={["v", execCls]} title={fresh.agent.at ? `最后心跳 ${fresh.agent.at} · 决策数据日 ${fresh.agent.asOf}` : "runtime_state 无记录"}>{execLabel}</span></div>
           <div class="kv"><span class="k">股价</span><span class:list={["v", lagDays(fresh.prices.asOf) > 4 && "down"]}>{fresh.prices.asOf ?? "—"}</span></div>
           <div class="kv"><span class="k">宏观</span><span class="v">{fresh.macro.asOf ?? "—"}</span></div>
-          <div class="kv"><span class="k">溢价</span><span class:list={["chip", premiumState]}>{premiumAge > 48 ? `${Math.floor(premiumAge / 24)} 天前` : premiumAge >= 1 ? `${premiumAge} 小时前` : "刚刚"}</span></div>
         </div>
       </aside>
 
@@ -107,11 +114,6 @@ const premiumState = premiumAge > 30 ? "bad" : premiumAge > 6 ? "warn" : "ok";
                         <span class="s">{b.ticker}</span>
                         <span class="p">{b.close.toFixed(2)}</span>
                         <span class:list={["d", ch === null ? "dim" : ch >= 0 ? "up" : "down"]}>{ch === null ? "—" : fmtPct(ch)}</span>
-                        {b.premium !== null && (
-                          <span class="p dim" title={`链上可成交溢价 · ${b.symbol ?? ""}`}>
-                            溢价 <b class={b.premium >= 0 ? "down" : "up"}>{fmtPct(b.premium, 3)}</b>
-                          </span>
-                        )}
                       </a>
                     );
                   })}
@@ -124,7 +126,7 @@ const premiumState = premiumAge > 30 ? "bad" : premiumAge > 6 ? "warn" : "ok";
         <main class="content">
           <slot />
           <div class="foot">
-            <span>MacroPilot — 定投 · 体制 · 漂移 · 财报，四引擎共享一个链上执行器 · 回测 run #{run?.id ?? "—"}</span>
+            <span>MacroPilot — 定投 · 体制 · 漂移 · 财报，四引擎共享一个纸面执行器 · 回测 run #{run?.id ?? "—"}</span>
             <span>纸面数据，不构成投资建议 · <a href="https://github.com/mnigc/macro-bnbchain" class="dim" style="text-decoration:underline">GitHub</a></span>
           </div>
         </main>
@@ -157,6 +159,126 @@ const premiumState = premiumAge > 30 ? "bad" : premiumAge > 6 ? "warn" : "ok";
           strip.dataset.marquee = "on";
         }
       }
+    </script>
+    <script>
+      /**
+       * 长表分页。静态站点没有服务端，切片只能在前端做：给 <table data-paginate> 用，
+       * 每页行数取 data-page-size（默认 20），可切 20 / 50 / 100 / 全部。
+       *
+       * 和外部筛选共存：筛选（交易流水的引擎标签）用 row.hidden，本脚本用 .pg-hide，
+       * 两套隐藏互不覆盖；筛选变化由 MutationObserver 接住，并退回第 1 页。
+       * "暂无记录"那类 colspan 占位行不参与分页，始终显示。
+       */
+      const PG_SIZES: { v: number; label: string }[] = [
+        { v: 20, label: "20" },
+        { v: 50, label: "50" },
+        { v: 100, label: "100" },
+        { v: Infinity, label: "全部" },
+      ];
+
+      /** 页码窗口：首尾 + 当前页 ±1，中间折成省略号 */
+      function pgPages(cur: number, pages: number): (number | null)[] {
+        const out: (number | null)[] = [];
+        for (let p = 1; p <= pages; p++) {
+          if (p === 1 || p === pages || Math.abs(p - cur) <= 1) {
+            if (out[out.length - 1] !== p) out.push(p);
+          } else if (out[out.length - 1] !== null) out.push(null);
+        }
+        return out;
+      }
+
+      function setupPager(table: HTMLTableElement): void {
+        const tbody = table.tBodies[0];
+        if (!tbody) return;
+        const rows = Array.from(tbody.rows).filter((r) => !r.querySelector("td.empty, td[colspan]"));
+        if (rows.length === 0) return;
+
+        let size = Number(table.dataset.pageSize) || PG_SIZES[0].v;
+        let page = 1;
+
+        const bar = document.createElement("div");
+        bar.className = "pager";
+        table.insertAdjacentElement("afterend", bar);
+
+        const render = (reset = false): void => {
+          const pool = rows.filter((r) => !r.hidden);
+          const pages = size === Infinity ? 1 : Math.max(1, Math.ceil(pool.length / size));
+          if (reset) page = 1;
+          page = Math.min(Math.max(1, page), pages);
+
+          const start = size === Infinity ? 0 : (page - 1) * size;
+          const end = size === Infinity ? pool.length : Math.min(start + size, pool.length);
+          const slice = pool.slice(start, end);
+          const onPage = new Set(slice);
+          for (const r of rows) {
+            r.classList.toggle("pg-hide", !onPage.has(r));
+            r.classList.remove("pg-last");
+          }
+
+          // 一页装得下就不摆控件；但要保住"每页行数"下拉，所以阈值取最小档
+          bar.hidden = pool.length <= PG_SIZES[0].v;
+          bar.replaceChildren();
+          if (bar.hidden) return;
+          slice[slice.length - 1]?.classList.add("pg-last");
+
+          const info = document.createElement("span");
+          info.className = "pg-info";
+          info.textContent = `${start + 1}–${end} / ${pool.length}`;
+
+          const btns = document.createElement("div");
+          btns.className = "pg-btns";
+          const add = (label: string, o: { on?: boolean; off?: boolean; go?: () => void }) => {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.textContent = label;
+            if (o.on) b.classList.add("on");
+            if (o.on) b.setAttribute("aria-current", "page");
+            if (o.off) b.disabled = true;
+            if (o.go) b.addEventListener("click", o.go);
+            btns.appendChild(b);
+          };
+
+          add("‹", { off: page <= 1, go: () => { page--; render(); } });
+          for (const p of pgPages(page, pages)) {
+            if (p === null) {
+              const gap = document.createElement("span");
+              gap.className = "pg-gap";
+              gap.textContent = "…";
+              btns.appendChild(gap);
+            } else {
+              add(String(p), { on: p === page, go: () => { page = p; render(); } });
+            }
+          }
+          add("›", { off: page >= pages, go: () => { page++; render(); } });
+
+          const sel = document.createElement("select");
+          sel.setAttribute("aria-label", "每页行数");
+          for (const s of PG_SIZES) {
+            const o = document.createElement("option");
+            o.value = String(s.v);
+            o.textContent = s.label;
+            if (s.v === size) o.selected = true;
+            sel.appendChild(o);
+          }
+          sel.addEventListener("change", () => {
+            size = sel.value === "Infinity" ? Infinity : Number(sel.value);
+            render(true);
+          });
+
+          bar.append(info, btns, sel);
+        };
+
+        // 筛选改的是 row.hidden；只观察这一个属性，本脚本改的 .pg-hide 不会反过来触发
+        new MutationObserver(() => render(true)).observe(tbody, {
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["hidden"],
+        });
+
+        render();
+      }
+
+      for (const t of document.querySelectorAll<HTMLTableElement>("table[data-paginate]")) setupPager(t);
     </script>
   </body>
 </html>

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import * as echarts from "echarts";
 import { REGIME_COLOR, type Band } from "../lib/bands";
 
@@ -113,6 +113,8 @@ export function markAreaFromBands(bands: Band[]) {
 export function EquityChart(props: {
   strategy: ChartPoint[];
   benchmark: ChartPoint[];
+  /** 第三条腿：60/40（60% 篮子月度再平衡 + 40% 现金计息），有数据才画 */
+  benchmark6040?: ChartPoint[];
   bands: Band[];
   tall?: boolean;
 }) {
@@ -126,7 +128,7 @@ export function EquityChart(props: {
         ...TOOLTIP,
         valueFormatter: (v) => `$${Number(v).toLocaleString("en-US", { maximumFractionDigits: 0 })}`,
       },
-      legend: { ...LEGEND, data: ["四引擎策略", "买入持有"] },
+      legend: { ...LEGEND, data: ["策略", "买入持有", ...(props.benchmark6040 ? ["60/40"] : [])] },
       grid: { left: 58, right: 20, top: 32, bottom: 60 },
       xAxis: AXIS_TIME,
       yAxis: {
@@ -140,7 +142,7 @@ export function EquityChart(props: {
       dataZoom: ZOOM_STYLE,
       series: [
         {
-          name: "四引擎策略",
+          name: "策略",
           type: "line",
           data: props.strategy.map((p) => [p.date, p.value]),
           showSymbol: false,
@@ -157,9 +159,21 @@ export function EquityChart(props: {
           lineStyle: { color: C.text2, width: 1.2, type: "dashed" },
           itemStyle: { color: C.text2 },
         },
+        ...(props.benchmark6040
+          ? [
+              {
+                name: "60/40",
+                type: "line" as const,
+                data: props.benchmark6040.map((p) => [p.date, p.value]),
+                showSymbol: false,
+                lineStyle: { color: C.purple, width: 1.2, type: "dotted" as const },
+                itemStyle: { color: C.purple },
+              },
+            ]
+          : []),
       ],
     },
-    [props.strategy, props.benchmark, props.bands],
+    [props.strategy, props.benchmark, props.benchmark6040, props.bands],
     props.tall ? "chart tall" : "chart",
   );
   return el;
@@ -238,6 +252,7 @@ const SIGNAL_META: { key: string; label: string; color: string }[] = [
   { key: "volatility", label: "波动率", color: C.up },
   { key: "rates", label: "利率", color: C.blue },
   { key: "trend", label: "趋势", color: C.purple },
+  { key: "credit", label: "信用", color: "#ff9f43" },
 ];
 
 export function SignalChart(props: { points: { date: string; signals: Record<string, number> }[] }) {
@@ -487,198 +502,139 @@ export function KlineChart(props: {
   return el;
 }
 
-/** 分类轴下的蜡烛 + 成交量：x 用预格式化标签，缺掉的分钟因此不会在轴上留下空洞 */
-function barLabel(ms: number): string {
-  return new Date(ms).toISOString().slice(5, 16).replace("T", " ");
-}
-
-/** 溢价的百分位刻度：0.001 → "+0.100%" */
-const asPct = (v: number) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(3)}%`;
-
-/** 七条线要能彼此分辨，但不能借用涨跌语义 —— 所以下面这组只做类别色 */
-const SERIES_COLORS = ["#fcd535", "#4b9bff", "#0ecb81", "#b06bf0", "#f6465d", "#ff9f43", "#5ad2f4"];
-
-/**
- * 日线口径的溢价历史。纵轴是"链上每股价相对美股同日收盘高出多少"，
- * 零线才是这条图的重点：零以上＝链上在抢筹，零以下＝链上折价。
- */
-export function PremiumHistoryChart(props: {
-  series: { ticker: string; points: { date: string; premium: number }[] }[];
+/** 蒙特卡洛前景扇形：p5–p95 外带 + p25–p75 内带 + 中位线。纵轴是"起始净值 = 1"的倍数 */
+export function FanChart(props: {
+  horizons: number[];
+  p5: number[];
+  p25: number[];
+  p50: number[];
+  p75: number[];
+  p95: number[];
 }) {
+  const axis = props.horizons.map((h) => `${h}d`);
+  const band = (lo: number[], hi: number[], color: string, name: string) => {
+    // ECharts 无原生置信带：stack 基线 + 差值层，基线透明
+    return [
+      {
+        name: `${name}-base`,
+        type: "line" as const,
+        data: lo,
+        stack: name,
+        lineStyle: { opacity: 0 },
+        symbol: "none",
+        silent: true,
+        tooltip: { show: false },
+      },
+      {
+        name,
+        type: "line" as const,
+        data: hi.map((v, i) => Math.max(0, v - (lo[i] as number))),
+        stack: name,
+        lineStyle: { opacity: 0 },
+        areaStyle: { color, silent: true },
+        symbol: "none",
+        silent: true,
+        tooltip: { show: false },
+      },
+    ];
+  };
   const el = useChart(
     {
       backgroundColor: "transparent",
-      animationDuration: 500,
-      tooltip: { trigger: "axis", ...TOOLTIP, valueFormatter: (v) => asPct(Number(v)) },
-      legend: { ...LEGEND, data: props.series.map((s) => s.ticker) },
-      grid: { left: 52, right: 20, top: 30, bottom: 60 },
-      xAxis: AXIS_TIME,
+      animationDuration: 400,
+      tooltip: { trigger: "axis", ...TOOLTIP, valueFormatter: (v) => `${(Number(v) * 100).toFixed(1)}%` },
+      legend: { ...LEGEND, data: ["中位数", "p25–p75", "p5–p95"] },
+      grid: { left: 46, right: 16, top: 28, bottom: 22 },
+      xAxis: { type: "category" as const, data: axis, axisLine: { lineStyle: { color: C.axis } }, axisTick: { show: false }, axisLabel: { color: C.text, fontSize: 10.5 } },
       yAxis: {
         type: "value",
         scale: true,
         axisLine: { show: false },
         axisTick: { show: false },
-        axisLabel: { color: C.text, fontSize: 11, formatter: (v: number) => `${(v * 100).toFixed(1)}%` },
+        axisLabel: { color: C.text, fontSize: 11, formatter: (v: number) => `${(v * 100).toFixed(0)}%` },
         splitLine: { lineStyle: { color: C.split } },
       },
-      dataZoom: [
+      series: [
+        ...band(props.p5, props.p95, "rgba(252,213,53,0.10)", "p5-p95"),
+        ...band(props.p25, props.p75, "rgba(252,213,53,0.16)", "p25-p75"),
         {
-          ...ZOOM_STYLE[0],
-          /** 默认只看最近 90 天：全期极值被个别错位交易日拉到 ±10%，整条带会压成一条直线 */
-          start: Math.max(0, 100 - (90 / 365) * 100),
-          end: 100,
+          name: "中位数",
+          type: "line" as const,
+          data: props.p50,
+          showSymbol: false,
+          lineStyle: { color: C.yellow, width: 2 },
+          itemStyle: { color: C.yellow },
+          markLine: {
+            silent: true,
+            symbol: "none",
+            animation: false,
+            label: { show: false },
+            lineStyle: { type: "dashed" as const, color: "rgba(255,255,255,0.16)", width: 1 },
+            data: [{ yAxis: 1 }],
+          },
         },
       ],
-      series: props.series.map((s, i) => {
-        const color = SERIES_COLORS[i % SERIES_COLORS.length] ?? C.yellow;
-        return {
-          name: s.ticker,
-          type: "line" as const,
-          data: s.points.map((p) => [p.date, p.premium]),
-          showSymbol: false,
-          lineStyle: { color, width: 1.3 },
-          itemStyle: { color },
-          ...(i === 0
-            ? {
-                markLine: {
-                  silent: true,
-                  symbol: "none",
-                  animation: false,
-                  label: { formatter: "平价", position: "insideStartTop", color: C.text, fontSize: 10 },
-                  lineStyle: { type: "dashed" as const, color: "rgba(255,255,255,0.22)", width: 1 },
-                  data: [{ yAxis: 0 }],
-                },
-              }
-            : {}),
-        };
-      }),
     },
-    [props.series],
-    "chart",
+    [props.horizons, props.p5, props.p25, props.p50, props.p75, props.p95],
+    "chart short",
   );
   return el;
 }
 
-export interface TickBar {
-  t: number;
-  o: number;
-  h: number;
-  l: number;
-  c: number;
-  v: number;
-}
-
-/**
- * 最近一轮采集到的分钟蜡烛。换标的用原生 select：这张图一次只看一只，
- * 七只叠在一起只会互相盖住，而它要回答的问题本来就是"这一枚现在有多活跃"。
- */
-export function TickChart(props: { bars: Record<string, TickBar[]>; order: string[] }) {
-  const [ticker, setTicker] = useState(props.order[0] ?? "");
-  const rows = props.bars[ticker] ?? [];
-  const labels = rows.map((r) => barLabel(r.t));
+/** 滚动 12 个月夏普：策略 vs 基准，零线以下说明"过去一年还在亏风险调整后收益" */
+export function RollingChart(props: {
+  strategy: { date: string; value: number }[];
+  benchmark: { date: string; value: number }[];
+}) {
   const el = useChart(
     {
       backgroundColor: "transparent",
-      animationDuration: 300,
-      tooltip: {
-        trigger: "axis",
-        ...TOOLTIP,
-        axisPointer: { ...TOOLTIP.axisPointer, type: "cross", label: { backgroundColor: C.panel, color: C.text2 } },
-        formatter: (params: unknown) => {
-          const ps = params as { axisValue: string; dataIndex: number }[];
-          const i = ps[0]?.dataIndex ?? 0;
-          const r = rows[i];
-          if (!r) return "";
-          const up = r.c >= r.o;
-          const col = up ? C.up : C.down;
-          return (
-            `<div style="font-weight:700;margin-bottom:5px">${r ? barLabel(r.t) + " UTC" : ""}</div>` +
-            `<div style="display:grid;grid-template-columns:auto auto;gap:2px 14px;font-family:var(--mono);font-size:11.5px">` +
-            `<span style="color:${C.text}">开</span><span>${r.o.toFixed(3)}</span>` +
-            `<span style="color:${C.text}">高</span><span>${r.h.toFixed(3)}</span>` +
-            `<span style="color:${C.text}">低</span><span>${r.l.toFixed(3)}</span>` +
-            `<span style="color:${C.text}">收</span><span style="color:${col}">${r.c.toFixed(3)}</span>` +
-            `<span style="color:${C.text}">量</span><span>${r.v.toFixed(2)}</span></div>`
-          );
-        },
-      },
-      legend: { ...LEGEND, data: ["价格", "成交量"], right: 8, top: 2 },
-      grid: { left: 56, right: 46, top: 30, bottom: 34 },
-      xAxis: {
-        type: "category" as const,
-        data: labels,
-        boundaryGap: true,
-        axisLine: { lineStyle: { color: C.axis } },
+      animationDuration: 400,
+      tooltip: { trigger: "axis", ...TOOLTIP, valueFormatter: (v) => Number(v).toFixed(2) },
+      legend: { ...LEGEND, data: ["策略", "买入持有"] },
+      grid: { left: 40, right: 16, top: 28, bottom: 22 },
+      xAxis: AXIS_TIME,
+      yAxis: {
+        type: "value",
+        axisLine: { show: false },
         axisTick: { show: false },
-        splitLine: { show: false },
-        axisLabel: { color: C.text, fontSize: 11, hideOverlap: true },
+        axisLabel: { color: C.text, fontSize: 11 },
+        splitLine: { lineStyle: { color: C.split } },
       },
-      yAxis: [
-        {
-          type: "value",
-          scale: true,
-          position: "left",
-          axisLine: { show: false },
-          axisTick: { show: false },
-          axisLabel: { color: C.text, fontSize: 11, formatter: (v: number) => v.toFixed(v < 10 ? 3 : 2) },
-          splitLine: { lineStyle: { color: C.split } },
-        },
-        {
-          type: "value",
-          position: "right",
-          splitLine: { show: false },
-          axisLine: { show: false },
-          axisTick: { show: false },
-          axisLabel: { color: C.text2, fontSize: 10, formatter: (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(0)}k` : v.toFixed(0)) },
-          /** 柱子压到底部 1/3，别和蜡烛抢视线 */
-          max: (v: { max: number }) => v.max * 3,
-        },
-      ],
       series: [
         {
-          name: "价格",
-          type: "candlestick" as const,
-          data: rows.map((r) => [r.o, r.c, r.l, r.h]),
-          barWidth: "62%",
-          itemStyle: { color: C.up, color0: C.down, borderColor: C.up, borderColor0: C.down },
+          name: "策略",
+          type: "line",
+          data: props.strategy.map((p) => [p.date, p.value]),
+          showSymbol: false,
+          lineStyle: { color: C.yellow, width: 1.5 },
+          itemStyle: { color: C.yellow },
         },
         {
-          name: "成交量",
-          type: "bar" as const,
-          data: rows.map((r) => r.v),
-          yAxisIndex: 1,
-          itemStyle: { color: "rgba(75,155,255,0.30)" },
-          silent: true,
+          name: "买入持有",
+          type: "line",
+          data: props.benchmark.map((p) => [p.date, p.value]),
+          showSymbol: false,
+          lineStyle: { color: C.text2, width: 1.1, type: "dashed" },
+          itemStyle: { color: C.text2 },
+        },
+        {
+          name: "零线",
+          type: "line" as const,
+          data: [],
+          markLine: {
+            silent: true,
+            symbol: "none",
+            animation: false,
+            label: { show: false },
+            lineStyle: { type: "dashed" as const, color: "rgba(246,70,93,0.35)", width: 1 },
+            data: [{ yAxis: 0 }],
+          },
         },
       ],
     },
-    [ticker, props.bars, props.order],
-    "chart",
+    [props.strategy, props.benchmark],
+    "chart short",
   );
-  return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "flex-end", margin: "0 0 6px" }}>
-        <select
-          value={ticker}
-          onChange={(e) => setTicker(e.target.value)}
-          style={{
-            background: C.panel,
-            color: "#eaecef",
-            border: `1px solid ${C.border}`,
-            borderRadius: 6,
-            padding: "3px 8px",
-            fontSize: 12,
-            fontFamily: "var(--mono)",
-          }}
-        >
-          {props.order.map((t) => (
-            <option key={t} value={t}>
-              {t}
-            </option>
-          ))}
-        </select>
-      </div>
-      {el}
-    </div>
-  );
+  return el;
 }

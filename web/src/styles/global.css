@@ -1,5 +1,5 @@
 /* ==========================================================================
-   MacroPilot 设计系统 —— 对齐 Binance Wallet 的视觉语言
+   MacroPilot 设计系统 —— 交易终端风格的视觉语言
    取舍：扁平深色面板 + 极细边框 + 数字等宽 + 高信息密度。
    刻意不用辉光/渐变文字/入场级联动画——那类效果会稀释数据，让终端像落地页。
    ========================================================================== */
@@ -234,6 +234,35 @@ button.chip:hover { background: rgba(255, 255, 255, 0.09); color: var(--text); }
 /* 表内迷你分位条：数字给精确值，这条只给"在区间的哪一段"的直觉 */
 .tbl .rank { display: inline-block; width: 46px; height: 4px; margin-left: 6px; border-radius: 2px; background: rgba(255, 255, 255, 0.09); vertical-align: middle; }
 .tbl .rank b { display: block; height: 100%; border-radius: 2px; background: var(--yellow); }
+
+/* ---------- 长表分页 ---------- */
+/* 分页用独立类隐藏行，避免和筛选的 row.hidden 互相覆盖 */
+.pg-hide { display: none; }
+/* 分页后可见末行不是 DOM 最后一行，:last-child 的收边规则落不到它身上，会多出一条线 */
+.tbl tbody tr.pg-last td { border-bottom: none; }
+.pager {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; border-top: 1px solid var(--line);
+  font-size: 11.5px; color: var(--text-4);
+}
+.pager .pg-info { font-family: var(--mono); }
+.pager .pg-btns { display: flex; align-items: center; gap: 2px; margin-left: auto; }
+.pager button {
+  min-width: 24px; height: 24px; padding: 0 6px;
+  border: 1px solid transparent; border-radius: 4px; background: transparent;
+  color: var(--text-3); font-family: var(--mono); font-size: 11.5px; font-weight: 500;
+  cursor: pointer; transition: background 0.14s, color 0.14s;
+}
+.pager button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.07); color: var(--text); }
+.pager button:disabled { opacity: 0.32; cursor: default; }
+.pager button.on { background: rgba(252, 213, 53, 0.13); color: var(--yellow); }
+.pager .pg-gap { padding: 0 3px; color: var(--text-4); }
+.pager select {
+  margin-left: 8px; height: 24px; padding: 0 4px;
+  background: var(--panel-2); color: var(--text-2);
+  border: 1px solid var(--line-2); border-radius: 4px;
+  font-family: var(--mono); font-size: 11.5px; cursor: pointer;
+}
 
 /* 涨跌/买卖的语义色必须压过 .strong/.faint/.dim 的灰白：同特异性下靠后的声明会赢，
    所以盈亏列一旦套上这些工具类就悄悄变回无色。 */

@@ -19,6 +19,9 @@ function bundleWith(overrides: Partial<MacroBundle> = {}): MacroBundle {
     volatility: series(900, "2026-09-22"), // VIX 落后 3 天
     rates: series(900, "2026-09-24"), // DGS10 落后 1 天
     trend: series(900, "2026-09-25"), // SP500 主日历
+    credit: series(900, "2026-09-24"), // 信用利差，日频
+    labor: series(300, "2026-09-01", 3), // 失业率（真实为月频，date 为参考月 1 号，尾部天然落后数周）
+    cash: series(900, "2026-09-24"), // DGS3MO，日频
     ...overrides,
   };
 }

@@ -1,77 +1,88 @@
 import { fetchMacroBundle, MAX_SERIES_LAG_DAYS } from "../data/fred.js";
 import { computeRegimeTimeline, WARMUP_DAYS, type RegimeConfig, type RegimePoint } from "../strategy/regime.js";
+import {
+  composeEquityTarget,
+  latestVolMultiplier,
+  latestValuationTilt,
+  type ValuationConfig,
+  type VolTargetConfig,
+} from "../strategy/overlays.js";
 import type { TradeDriver } from "../strategy/drivers.js";
 import {
   initSchema,
   latestPrices,
-  latestPremiums,
   loadPortfolio,
   loadRuntimeState,
   recordTrades,
   savePortfolio,
   saveRuntimeState,
+  saveExecutorPreview,
   upcomingEarnings,
+  latestAdv,
   upsertEarningsDates,
   getPool,
+  usClosesByTicker,
 } from "../db/index.js";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { parseFredCsv } from "../data/stats.js";
 import type { Point } from "../data/stats.js";
+import { loadCape } from "../backtest/context.js";
 
 /**
- * 执行器：四引擎（定投/体制/漂移/财报）→ 一张目标权重表 → 与当前组合求差额 → 交易。
+ * 执行器：六个模块（定投/体制/波动率目标/估值锚/漂移/财报）→ 一张目标权重表 → 与当前组合求差额 → 交易。
  *
- * paper 的成交价 = 最近同步收盘价 × (1 + 链上可成交溢价)：钱确实按链上价付出去，持仓却仍按
- * 收盘参考价估值。两者之差就是"在链上买美股的真实摩擦"，它会原样留在净值曲线里，
- * 而不是被折进 slippagePercent 那个笼统的执行成本假设。目标权重与漂移仍按参考价计算，
- * 因此四引擎的决策与回测（run #14）完全可比，差异只出现在成交执行这一层。
- * live 模式把每笔差额交给 trader（RFQ 链路，见 src/exec/live.ts），真实成交价里本就含溢价。
- * 财报引擎只在执行器生效：历史财报日无法免费回溯 6.5 年，回测中关闭。
+ * 目标仓位三层合成与回测同口径：体制档位（含 Sahm 门）× 波动率乘数 × (1+估值偏移)，
+ * 个股层再叠加财报缩放。纸面成交价 = 最近同步收盘价，成本逐笔计提（半价差+√冲击，按 ADV20；
+ * 无成交量数据退回 slippagePercent），现金按 DGS3MO 日频计息。
+ *
+ * dryRun = true 时全流程照算但不落任何库——这是"下一轮会做什么"的预演入口。
+ * 正常运行还会写一份 executor_preview（下一轮预告，确定性规则可提前算出下轮动作）。
  */
-
-/** live 模式下由外部提供的成交实现；paper 模式不需要 */
-export interface Trader {
-  /** 以 notionalUsdt 买入/卖出 ticker，返回实际成交数量与均价 */
-  fill(order: { ticker: string; side: "buy" | "sell"; notionalUsdt: number }): Promise<{ units: number; price: number; txHash?: string }>;
-}
 
 export interface ExecutorConfig {
   tickers: string[];
-  mode: "paper" | "live";
+  /** 账本分区标签（paper），与回测的 backtest 分区区分 */
+  mode: string;
   startCash: number;
   dcaUsdt: number;
   driftThresholdPp: number;
   minTradeUsdt: number;
-  /** 预期单边成本（百分比，滑点+价差+gas 的合计近似），paper 记账与 live 护栏共用 */
+  /** 无成交量数据时的退回单边成本（百分比） */
   slippagePercent: number;
   regime: RegimeConfig;
   earnings: { enabled: boolean; riskOffDaysBefore: number; scaleFactor: number; restoreDaysAfter: number };
-  /** mode=live 必需 */
-  trader?: Trader;
+  volTarget: VolTargetConfig & { enabled: boolean };
+  valuation: ValuationConfig & { enabled: boolean };
+  cost: { halfSpreadBps: number; impactCoef: number; earningsMult: number };
+  cashInterest: boolean;
+  /** 只算不写：跳过全部持久化，返回值里带完整预告 */
+  dryRun?: boolean;
 }
 
 export interface ExecutionSummary {
   asOf: string;
   regime: RegimePoint;
   prices: Map<string, number>;
-  /** 本轮采用的溢价快照时刻；null = 表里没有可用快照，成交退化为纯参考价 */
-  premiumAsOf: string | null;
-  premiums: Map<string, number>;
   portfolioBefore: { cash: number; positions: Map<string, number> };
   equityBefore: number;
   targetWeights: Record<string, number>;
+  /** 三层合成的目标股票仓位（体制 × 波动率 × 估值） */
+  composedEquityTarget: number;
+  composition: { regimeTarget: number; volMult: number | undefined; tilt: number | undefined };
+  /** 本轮计提的现金利息（美元；未启用或无利率数据为 0） */
+  cashInterestUsd: number;
   trades: {
     date: string;
     ticker: string;
     unitsDelta: number;
     notionalUsdt: number;
+    costUsd: number;
     drivers: TradeDriver[];
-    txHash?: string;
-    /** 这笔成交计入了多少溢价；live 成交由真实报价决定，记 null */
-    premium: number | null;
   }[];
   equityAfter: number;
   earningsAffected: string[];
+  /** 下一轮预告（正常与 dry-run 都返回；只有非 dry-run 落库） */
+  preview: Record<string, unknown>;
 }
 
 const utcToday = (): string => new Date().toISOString().slice(0, 10);
@@ -98,19 +109,19 @@ async function importEarningsCsvs(): Promise<number> {
 }
 
 export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
-  if (cfg.mode === "live" && !cfg.trader) throw new Error("live 模式必须提供 trader（见 src/exec/live.ts）");
-  const isLive = cfg.mode === "live";
-  const feeRate = cfg.slippagePercent / 100;
   await initSchema();
-  const importedEarnings = await importEarningsCsvs();
-  if (importedEarnings) console.log(`财报日历已从 CSV 导入 ${importedEarnings} 条`);
+  if (!cfg.dryRun) {
+    const importedEarnings = await importEarningsCsvs();
+    if (importedEarnings) console.log(`财报日历已从 CSV 导入 ${importedEarnings} 条`);
+  }
   const asOf = utcToday();
 
-  // 1) 体制引擎：FRED → 时间线 → 最新状态，并与上一轮运行态比较得出"是否切换"
+  // 1) 体制引擎：FRED → 时间线 → 最新状态（含 Sahm 门），并与上一轮运行态比较得出"是否切换"
   const bundle = await fetchMacroBundle();
   const timeline = computeRegimeTimeline(bundle, cfg.regime);
   const regimePoint = timeline[timeline.length - 1];
   if (!regimePoint) throw new Error("体制时间线为空：宏观序列数据不足（每路需 ≥3 年历史）");
+  const rp: RegimePoint = regimePoint;
   const calendarLag = Math.round(
     (Date.parse(bundle.trend.at(-1)?.date ?? regimePoint.date) - Date.parse(regimePoint.date)) / 86_400_000,
   );
@@ -122,14 +133,27 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   const prevState = await loadRuntimeState(cfg.mode);
   const regimeChanged = prevState !== null && prevState.equityTarget !== regimePoint.equityTarget;
 
-  // 2) 价格与组合状态
+  // 2) 叠加层：波动率目标乘数（近 22 日收盘）+ 估值锚偏移（CAPE 月度）
+  let volMult: number | undefined;
+  if (cfg.volTarget.enabled) {
+    const since = new Date(Date.parse(asOf) - (cfg.volTarget.lookbackDays + 30) * 86_400_000).toISOString().slice(0, 10);
+    const closesMap = await usClosesByTicker(cfg.tickers, since);
+    const arrays = new Map<string, number[]>(
+      [...closesMap].map(([t, m]) => [t, [...m.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, v]) => v)]),
+    );
+    volMult = latestVolMultiplier(arrays, cfg.volTarget);
+  }
+  const tilt = cfg.valuation.enabled ? latestValuationTilt(loadCape(), cfg.valuation) : undefined;
+  const composedEquityTarget = composeEquityTarget(regimePoint.equityTarget, volMult, tilt);
+  if (regimePoint.gateActive) {
+    // Sahm 门已在时间线内把 regime 目标压回 risk-off 档；这里只透传，不重复处理
+  }
+
+  // 3) 价格与组合状态
   const prices = await latestPrices(cfg.tickers);
   for (const t of cfg.tickers) {
     if (!prices.get(t)) throw new Error(`缺少 ${t} 的最新价格——先运行 GitHub Actions 同步或 python scripts/sync-prices.py`);
   }
-  // 模拟成交（paper，以及任何试运行用的 mode）按"收盘价 × (1+溢价)"计价；
-  // live 的成交价来自真实报价，溢价本就含在里面
-  const snapshot = !isLive ? await latestPremiums(cfg.tickers) : { capturedAt: null, premiums: new Map<string, number>() };
   const { positions, cash } = await loadPortfolio(cfg.mode);
   let workingCash = cash;
   let seeded = false;
@@ -138,16 +162,26 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     seeded = true;
   }
 
+  // 3.5) 现金计息：以上一轮决策日到今天的日历天数计（跨周末照常计息，上限 10 天防长停后一次性补太多）
+  let cashInterestUsd = 0;
+  if (cfg.cashInterest && prevState && workingCash > 0) {
+    const rateSeries = bundle.cash ?? [];
+    const rate = [...rateSeries].reverse().find((p) => p.date <= asOf)?.value;
+    const days = Math.min(10, Math.max(0, Math.round((Date.parse(asOf) - Date.parse(prevState.asOf)) / 86_400_000)));
+    if (rate !== undefined && days > 0) {
+      cashInterestUsd = (workingCash * rate) / 100 / 365 * days;
+      workingCash += cashInterestUsd;
+    }
+  }
+
   const priceOf = (t: string): number => prices.get(t) as number;
-  /** 本轮的真实付出/所得单价：参考价之上叠加链上溢价 */
-  const execPriceOf = (t: string): number => priceOf(t) * (1 + (snapshot.premiums.get(t) ?? 0));
   const equityOf = (p: Map<string, number>, c: number): number => {
     let v = c;
     for (const [t, u] of p) v += u * priceOf(t);
     return v;
   };
 
-  // 3) 定投引擎：仅周五注入，且当日未重复（以 dca 驱动标记去重）
+  // 4) 定投引擎：仅周五注入，且当日未重复（以 dca 驱动标记去重）
   let dcaApplied = false;
   if (cfg.dcaUsdt > 0 && isFriday(asOf)) {
     const { rows } = await getPool().query<{ n: string }>(
@@ -160,11 +194,11 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     }
   }
 
-  // 4) 财报引擎：临近财报（前 N 天~后 M 天）的个股目标权重乘以缩放系数，余额留在现金筒
+  // 5) 财报引擎：临近财报（前 N 天~后 M 天）的个股目标权重乘以缩放系数，余额留在现金筒
   const earningsAffected: string[] = [];
   const scaleOf = new Map<string, number>(cfg.tickers.map((t) => [t, 1]));
+  const upcoming = await upcomingEarnings(cfg.tickers, asOf);
   if (cfg.earnings.enabled) {
-    const upcoming = await upcomingEarnings(cfg.tickers, asOf);
     const afterDays = cfg.earnings.restoreDaysAfter;
     for (const t of cfg.tickers) {
       for (const d of upcoming.get(t) ?? []) {
@@ -178,32 +212,46 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     }
   }
 
-  // 5) 目标权重表：体制决定总股票仓位，等权分到个股，财报引擎逐股缩放，余量归现金
+  // 6) 目标权重表：三层合成的股票仓位等权分到个股，财报引擎逐股缩放，余量归现金
   const equityBefore = equityOf(positions, workingCash);
-  const perTicker = regimePoint.equityTarget / cfg.tickers.length;
+  const perTicker = composedEquityTarget / cfg.tickers.length;
   const targetWeights: Record<string, number> = {};
   for (const t of cfg.tickers) targetWeights[t] = equityBefore > 0 ? perTicker * (scaleOf.get(t) ?? 1) : 0;
 
+  // 逐笔成本：ADV20 可得则半价差+冲击，否则退回 slippagePercent
+  const adv = await latestAdv(cfg.tickers);
+  const costRateOf = (t: string, notional: number): number => {
+    const a = adv.get(t);
+    let bps = a !== undefined && a > 0 ? cfg.cost.halfSpreadBps + cfg.cost.impactCoef * Math.sqrt(notional / a) * 10_000 : cfg.slippagePercent * 100;
+    if ((scaleOf.get(t) ?? 1) !== 1) bps *= cfg.cost.earningsMult;
+    return bps / 10_000;
+  };
+
   if (equityBefore <= 0) {
-    // 空组合且零现金：只记录状态，不交易
-    await savePortfolio(cfg.mode, positions, 0);
-    await saveRuntimeState(cfg.mode, { regime: regimePoint.regime, equityTarget: regimePoint.equityTarget, score: regimePoint.score, asOf });
+    const preview = buildPreview();
+    if (!cfg.dryRun) {
+      await savePortfolio(cfg.mode, positions, 0);
+      await saveRuntimeState(cfg.mode, { regime: regimePoint.regime, equityTarget: regimePoint.equityTarget, score: regimePoint.score, asOf });
+      await saveExecutorPreview(cfg.mode, preview);
+    }
     return {
       asOf,
       regime: regimePoint,
       prices,
-      premiumAsOf: snapshot.capturedAt,
-      premiums: snapshot.premiums,
       portfolioBefore: { cash, positions },
       equityBefore: 0,
       targetWeights,
+      composedEquityTarget,
+      composition: { regimeTarget: regimePoint.equityTarget, volMult, tilt },
+      cashInterestUsd,
       trades: [],
       equityAfter: 0,
       earningsAffected: [...new Set(earningsAffected)],
+      preview,
     };
   }
 
-  // 6) 触发判断：定注入金 / 首次建仓 / 体制切换 / 任一标的漂移超阈值
+  // 7) 触发判断：定注入金 / 首次建仓 / 体制切换 / 任一标的漂移超阈值
   const driftOf = (t: string): number => {
     const px = priceOf(t);
     const w = px > 0 && equityBefore > 0 ? ((positions.get(t) ?? 0) * px) / equityBefore : 0;
@@ -225,11 +273,9 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   if (batchDrivers.length) {
     const plan = cfg.tickers.map((t) => {
       const px = priceOf(t);
-      const exec = execPriceOf(t);
       const targetUnits = (equityBefore * (targetWeights[t] ?? 0)) / px;
       const delta = targetUnits - (positions.get(t) ?? 0);
-      // 目标股数仍按参考价求（决策口径与回测一致），名义额按链上有效价结算（执行口径）
-      return { t, exec, delta, notional: Math.abs(delta) * exec };
+      return { t, px, delta, notional: Math.abs(delta) * px };
     });
     const driversFor = (t: string): TradeDriver[] => [
       ...batchDrivers,
@@ -237,58 +283,109 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     ];
 
     // 先卖后买：卖出释放的现金可立即用于买入；买入受可用现金硬约束（含成本），杜绝负现金
-    const execute = async (p: { t: string; exec: number; delta: number; notional: number }, buying: boolean) => {
-      // live 的 snapshot.premiums 恒为空（真实报价里已含溢价），所以这一项天然只在 paper 有值
-      const prem = snapshot.premiums.get(p.t) ?? null;
+    const execute = (p: { t: string; px: number; delta: number; notional: number }, buying: boolean) => {
       if (buying) {
-        const notional = Math.min(p.notional, workingCash / (1 + feeRate));
-        if (notional * (1 + feeRate) < cfg.minTradeUsdt) return;
-        const delta = notional / p.exec;
-        if (isLive) {
-          const fill = await cfg.trader!.fill({ ticker: p.t, side: "buy", notionalUsdt: notional });
-          workingCash -= fill.units * fill.price * (1 + feeRate);
-          positions.set(p.t, (positions.get(p.t) ?? 0) + fill.units);
-          trades.push({ date: asOf, ticker: p.t, unitsDelta: fill.units, notionalUsdt: fill.units * fill.price, drivers: driversFor(p.t), txHash: fill.txHash, premium: null });
-          return;
-        }
-        workingCash -= notional * (1 + feeRate);
+        const rate = costRateOf(p.t, Math.min(p.notional, workingCash));
+        const notional = Math.min(p.notional, workingCash / (1 + rate));
+        if (notional * (1 + rate) < cfg.minTradeUsdt) return;
+        const cost = notional * rate;
+        const delta = notional / p.px;
+        workingCash -= notional * (1 + rate);
         positions.set(p.t, (positions.get(p.t) ?? 0) + delta);
-        trades.push({ date: asOf, ticker: p.t, unitsDelta: delta, notionalUsdt: notional, drivers: driversFor(p.t), premium: prem });
+        trades.push({ date: asOf, ticker: p.t, unitsDelta: delta, notionalUsdt: notional, costUsd: cost, drivers: driversFor(p.t) });
         return;
       }
       if (p.notional < cfg.minTradeUsdt) return;
-      if (isLive) {
-        const fill = await cfg.trader!.fill({ ticker: p.t, side: "sell", notionalUsdt: p.notional });
-        workingCash += fill.units * fill.price * (1 - feeRate);
-        positions.set(p.t, (positions.get(p.t) ?? 0) - fill.units);
-        trades.push({ date: asOf, ticker: p.t, unitsDelta: -fill.units, notionalUsdt: fill.units * fill.price, drivers: driversFor(p.t), txHash: fill.txHash, premium: null });
-        return;
-      }
-      workingCash += p.notional * (1 - feeRate);
+      const rate = costRateOf(p.t, p.notional);
+      const cost = p.notional * rate;
+      workingCash += p.notional * (1 - rate);
       positions.set(p.t, (positions.get(p.t) ?? 0) + p.delta);
-      trades.push({ date: asOf, ticker: p.t, unitsDelta: p.delta, notionalUsdt: p.notional, drivers: driversFor(p.t), premium: prem });
+      trades.push({ date: asOf, ticker: p.t, unitsDelta: p.delta, notionalUsdt: p.notional, costUsd: cost, drivers: driversFor(p.t) });
     };
 
-    for (const p of plan.filter((x) => x.delta < 0)) await execute(p, false);
-    for (const p of plan.filter((x) => x.delta > 0)) await execute(p, true);
+    for (const p of plan.filter((x) => x.delta < 0)) execute(p, false);
+    for (const p of plan.filter((x) => x.delta > 0)) execute(p, true);
   }
 
-  // 7) 持久化
-  await savePortfolio(cfg.mode, positions, workingCash);
-  await saveRuntimeState(cfg.mode, { regime: regimePoint.regime, equityTarget: regimePoint.equityTarget, score: regimePoint.score, asOf });
-  if (trades.length) await recordTrades(cfg.mode, trades);
+  const preview = buildPreview();
+
+  // 8) 持久化（dry-run 全跳过）
+  if (!cfg.dryRun) {
+    await savePortfolio(cfg.mode, positions, workingCash);
+    await saveRuntimeState(cfg.mode, { regime: regimePoint.regime, equityTarget: regimePoint.equityTarget, score: regimePoint.score, asOf });
+    if (trades.length) await recordTrades(cfg.mode, trades);
+    await saveExecutorPreview(cfg.mode, preview);
+  }
 
   return {
     asOf,
     regime: regimePoint,
     prices,
-    premiumAsOf: snapshot.capturedAt,
-    premiums: snapshot.premiums,
     portfolioBefore: { cash, positions },
     equityBefore,
     targetWeights,
+    composedEquityTarget,
+    composition: { regimeTarget: regimePoint.equityTarget, volMult, tilt },
+    cashInterestUsd,
     trades,
     equityAfter: equityOf(positions, workingCash),
     earningsAffected: [...new Set(earningsAffected)],
+    preview,
   };
+
+  /** 下一轮预告：确定性规则可提前算出"下一轮会做什么"（dry-run 也返回） */
+  function buildPreview(): Record<string, unknown> {
+    const nextFriday = (() => {
+      const now = new Date();
+      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+      d.setUTCDate(d.getUTCDate() + ((5 - d.getUTCDay() + 7) % 7 || 7));
+      return d.toISOString().slice(0, 10);
+    })();
+    const eq = equityOf(positions, workingCash);
+    // 下周五定投按当期目标权重分摊（财报窗口内的标的按缩放后权重）
+    const weights = cfg.tickers.map((t) => perTicker * (scaleOf.get(t) ?? 1));
+    const wSum = weights.reduce((a, b) => a + b, 0) || 1;
+    const plannedDca = cfg.tickers.map((t, i) => ({
+      ticker: t,
+      usdt: Math.round(((cfg.dcaUsdt * (weights[i] as number)) / wSum) * 100) / 100,
+    }));
+    const drifts = cfg.tickers.map((t) => ({
+      ticker: t,
+      driftPp: Math.round(driftOfSafe(t) * 100) / 100,
+      thresholdPp: cfg.driftThresholdPp,
+    }));
+    const earningsNext14d: { ticker: string; date: string }[] = [];
+    for (const t of cfg.tickers) {
+      for (const d of upcoming.get(t) ?? []) {
+        const diff = Math.round((Date.parse(d) - Date.parse(asOf)) / 86_400_000);
+        if (diff >= 0 && diff <= 14) earningsNext14d.push({ ticker: t, date: d });
+      }
+    }
+    return {
+      asOf,
+      regime: rp.regime,
+      score: Math.round(rp.score * 1000) / 1000,
+      sahm: rp.sahm,
+      gateActive: rp.gateActive,
+      composition: {
+        regimeTarget: rp.equityTarget,
+        volMult: volMult ?? null,
+        tilt: tilt ?? null,
+        final: Math.round(composedEquityTarget * 10000) / 10000,
+      },
+      equity: Math.round(eq * 100) / 100,
+      drifts,
+      nextFriday: cfg.dcaUsdt > 0 ? { date: nextFriday, injectionUsdt: cfg.dcaUsdt, planned: plannedDca } : null,
+      earningsNext14d,
+    };
+  }
+
+  // 预告里的漂移：组合未变时与上面 driftOf 相同；组合已按本轮成交更新后，预告反映"若现在就是下一轮"
+  function driftOfSafe(t: string): number {
+    const px = priceOf(t);
+    const eq = equityOf(positions, workingCash);
+    const w = px > 0 && eq > 0 ? ((positions.get(t) ?? 0) * px) / eq : 0;
+    const tgt = perTicker * (scaleOf.get(t) ?? 1);
+    return (w - tgt) * 100;
+  }
 }

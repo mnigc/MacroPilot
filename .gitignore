@@ -4,7 +4,6 @@ dist/
 *.local
 data/fred/
 data/backtest/
-data/tokens.json
 web/dist/
 web/.astro/
 *.log

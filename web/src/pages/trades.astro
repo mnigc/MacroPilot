@@ -1,6 +1,6 @@
 ---
 import Base from "../layouts/Base.astro";
-import { getTrades } from "../lib/db";
+import { getTrades, getExecutorRun, getRealVsPaper } from "../lib/db";
 import { DRIVER_LABEL, parseDrivers, type Driver } from "../lib/drivers";
 import { readFileSync } from "node:fs";
 
@@ -10,6 +10,8 @@ const dcaUsdt = (JSON.parse(readFileSync("../config/strategy.json", "utf8")) as 
 
 const paperTrades = await getTrades("paper", 200);
 const backtestTrades = await getTrades("backtest", 60);
+const executor = await getExecutorRun("paper");
+const realVsPaper = await getRealVsPaper();
 
 const fmt = (v: number) => `$${Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
 
@@ -32,13 +34,82 @@ const pillColor: Record<string, string> = {
   regime: "yellow",
   drift: "purple",
   earnings: "warn",
-};---
+};
+
+/**
+ * 执行心跳。runtime_state 每轮 upsert 一次，所以 updated_at 就是"上次真正跑完一轮"的时刻；
+ * 只显示数据日会盖住"守卫拦下、今天没跑"这种状态。阈值按日频节拍：>30h 漏一轮，>54h 连着漏两轮。
+ */
+const execAgeH = executor ? (Date.now() - Date.parse(executor.at)) / 3_600_000 : null;
+const execChip = execAgeH === null ? "" : execAgeH <= 30 ? "ok" : execAgeH <= 54 ? "warn" : "bad";
+const execAgeLabel =
+  execAgeH === null ? "未运行" : execAgeH < 1 ? `${Math.round(execAgeH * 60)} 分钟前` : execAgeH < 48 ? `${execAgeH.toFixed(0)} 小时前` : `${(execAgeH / 24).toFixed(1)} 天前`;
+
+/**
+ * 最近一轮的成交。created_at 只有 MM-DD 没有年，所以年份从心跳时刻借；跨年时
+ * （12 月末的轮次在 1 月查看）借来的年份差出近一年，超过半年就翻到相邻年再算。
+ * 之后按"距心跳 10 分钟内"归并成一批 —— 一轮就是一次执行，不该按自然小时切。
+ */
+const roundOf = (() => {
+  if (!executor) return { rows: [] as typeof paperTrades, stamps: [] as string[] };
+  const year = Number(executor.at.slice(0, 4));
+  const ref = Date.parse(executor.at);
+  const tsOf = (t: (typeof paperTrades)[number]): number => {
+    const stamp = `${t.createdAt!.replace(" ", "T")}Z`;
+    let ms = Date.parse(`${year}-${stamp}`);
+    if (Math.abs(ms - ref) > 180 * 86_400_000) {
+      const flipped = Date.parse(`${year + (ms < ref ? 1 : -1)}-${stamp}`);
+      if (Math.abs(flipped - ref) < Math.abs(ms - ref)) ms = flipped;
+    }
+    return ms;
+  };
+  const rows = paperTrades.filter((t) => t.createdAt && Math.abs(tsOf(t) - ref) < 600_000);
+  return { rows, stamps: [...new Set(rows.map((t) => t.createdAt!.slice(6).trim()))].sort() };
+})();
+const roundTickers = [...new Set(roundOf.rows.map((t) => t.ticker))];
+
+const nextDca = (() => {
+  const now = new Date();
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  d.setUTCDate(d.getUTCDate() + ((5 - d.getUTCDay() + 7) % 7 || 7));
+  return { date: d.toISOString().slice(0, 10), days: Math.round((d.getTime() - now.getTime()) / 86_400_000) };
+})();
+
+const dcaCount = paperTrades.filter((t) => parseDrivers(t.reason).includes("dca")).length;---
 <Base active="trades" crumb="交易流水" sub="每一笔成交标注全部触发引擎 —— 定投 · 体制 · 漂移 · 财报可同日共触发">
   <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
     <span class="chip">paper {paperTrades.length} 笔</span>
     <span class="chip">backtest 抽样 {backtestTrades.length} 笔</span>
   </div>
 
+  <div class="faint" style="margin:0 0 6px">
+    执行心跳 · <b class="mono">runtime_state.updated_at</b> 每跑完一轮就写一次，停在上一轮说明守卫拦下了这一轮
+  </div>
+  <div class="tiles">
+    <div class="tile">
+      <div class="tile-k">上一轮执行（UTC）</div>
+      <div class="tile-v sm">{executor ? `${executor.at.slice(5, 16).replace("T", " ")}Z` : "未运行"}</div>
+      <div class="tile-s">
+        <span class:list={["chip", execChip]}>{execAgeLabel}</span> 决策数据日 {executor?.asOf ?? "—"}
+      </div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">该轮成交</div>
+      <div class="tile-v sm">{roundOf.rows.length} 笔 · {roundTickers.length} 只</div>
+      <div class="tile-s">
+        {roundOf.stamps.length
+          ? `落库 ${roundOf.stamps.length} 个时刻：${roundOf.stamps.join(" / ")}`
+          : "该轮心跳前后 10 分钟内没有成交（守卫或阈值未触发）"}
+      </div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">下一轮定投</div>
+      <div class="tile-v sm">{nextDca.date}</div>
+      <div class="tile-s">周五 13:00 UTC · T-{nextDca.days} 天 · 第 {dcaCount + 1} 次</div>
+    </div>
+  </div>
+
+  <div class="faint" style="margin:14px 0 6px">账本汇总 · paper 全量</div>
   <div class="tiles">
     <div class="tile">
       <div class="tile-k">Paper 成交笔数</div>
@@ -89,9 +160,46 @@ const pillColor: Record<string, string> = {
     </div>
   </div>
 
+  {realVsPaper.length > 0 && (
+    <div class="panel" style="margin-top:12px">
+      <div class="panel-hd">
+        <h2>真实账本 · 实测滑点</h2><span class="hint">真实成交价 vs 同日收盘参考价 —— 成本模型的现实校准</span>
+        <div class="right"><span class="chip">npm run import-real -- data/real/trades.csv</span></div>
+      </div>
+      <div class="panel-bd flush">
+        <table class="tbl" data-paginate>
+          <thead><tr><th class="l">日期</th><th class="l">标的</th><th class="l">方向</th><th>真实成交价</th><th>当日收盘</th><th>滑差</th><th>滑差成本</th></tr></thead>
+          <tbody>
+            {realVsPaper.map((r) => {
+              const slip = r.realPx !== null ? r.realPx / r.paperClose - 1 : null;
+              const cost = slip !== null ? Math.abs(r.units_delta) * r.paperClose * slip : null;
+              return (
+                <tr>
+                  <td class="l dim">{r.date}</td>
+                  <td class="l t"><a class="tk" href={`/ticker/${r.ticker}`}>{r.ticker}</a></td>
+                  <td class={r.units_delta >= 0 ? "l up" : "l down"}>{r.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
+                  <td>{r.realPx?.toFixed(2) ?? "—"}</td>
+                  <td class="dim">{r.paperClose.toFixed(2)}</td>
+                  <td class={slip === null ? "faint" : slip !== null && ((r.units_delta > 0) === slip >= 0) ? "down" : "up"}>{slip === null ? "—" : `${slip >= 0 ? "+" : ""}${(slip * 100).toFixed(3)}%`}</td>
+                  <td class={cost === null ? "faint" : cost >= 0 ? "down" : "up"}>{cost === null ? "—" : `${cost >= 0 ? "+" : "−"}$${Math.abs(cost).toFixed(2)}`}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-bd" style="padding-top:0">
+        <div class="faint" style="line-height:1.65">
+          买入比收盘贵、卖出比收盘便宜 = 付出滑点（红）。把这里实测的滑差跟回测成本模型（半价差+√冲击）对比，
+          偏得远就该改 config 里的 cost 参数——成本假设是回测可信度里最脆弱的一环。
+        </div>
+      </div>
+    </div>
+  )}
+
   <div class="panel" style="margin-top:12px">
     <div class="panel-hd">
-      <h2>Paper 执行记录</h2><span class="hint">点引擎标签筛选 · 溢价列 = 该笔相对美股参考价多付/多收的部分，— 为接入溢价之前的记录</span>
+      <h2>Paper 执行记录</h2><span class="hint">点引擎标签筛选 · 执行列为该笔落库时刻（UTC）</span>
       <div class="right">
         <button class="chip" data-all="1" type="button">全部</button>
         {attribution.filter((r) => r.count > 0).map((r) => (
@@ -100,30 +208,19 @@ const pillColor: Record<string, string> = {
       </div>
     </div>
     <div class="panel-bd flush">
-      <table class="tbl" id="paper-tbl">
-        <thead><tr><th class="l">日期</th><th class="l">标的</th><th class="l">方向</th><th>数量（股）</th><th>金额</th><th>链上溢价</th><th class="l">触发引擎</th></tr></thead>
+      <table class="tbl" id="paper-tbl" data-paginate>
+        <thead><tr><th class="l">日期</th><th class="l">执行（UTC）</th><th class="l">标的</th><th class="l">方向</th><th>数量（股）</th><th>金额</th><th class="l">触发引擎</th></tr></thead>
         <tbody>
           {paperTrades.map((t) => {
             const ds = parseDrivers(t.reason);
-            // 溢价成本 = 名义额里属于"比参考价贵"的那一截；成交早于溢价接入的记录为 null，显示 —
-            const cost = t.premium === null || t.premium === undefined ? null : (t.notional_usdt * t.premium) / (1 + t.premium);
             return (
               <tr data-drivers={ds.join(" ")}>
                 <td class="l dim">{t.date}</td>
+                <td class="l faint">{t.createdAt ?? "—"}</td>
                 <td class="l t"><a class="tk" href={`/ticker/${t.ticker}`}>{t.ticker}</a></td>
                 <td class={t.units_delta >= 0 ? "l up" : "l down"}>{t.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
                 <td>{Math.abs(t.units_delta).toFixed(4)}</td>
                 <td class="strong">{fmt(t.notional_usdt)}</td>
-                <td>
-                  {cost === null ? (
-                    <span class="faint">—</span>
-                  ) : (
-                    <>
-                      <span class={t.premium! >= 0 ? "down" : "up"}>{(t.premium! * 100).toFixed(3)}%</span>
-                      <span class={cost >= 0 ? "down" : "up"}> {cost >= 0 ? "+" : "−"}${Math.abs(cost).toFixed(2)}</span>
-                    </>
-                  )}
-                </td>
                 <td class="l t">{ds.map((d) => <span class={`pill ${d}`}>{DRIVER_LABEL[d]}</span>)}</td>
               </tr>
             );
@@ -138,7 +235,7 @@ const pillColor: Record<string, string> = {
   <div class="panel" style="margin-top:12px">
     <div class="panel-hd"><h2>回测成交抽样</h2><span class="hint">最近 {backtestTrades.length} 笔 · 按日期倒序 · 完整序列见 trades 表 mode=backtest</span></div>
     <div class="panel-bd flush">
-      <table class="tbl">
+      <table class="tbl" data-paginate>
         <thead><tr><th class="l">日期</th><th class="l">标的</th><th class="l">方向</th><th>金额</th><th class="l">触发引擎</th></tr></thead>
         <tbody>
           {backtestTrades.map((t) => (
@@ -153,14 +250,6 @@ const pillColor: Record<string, string> = {
           {backtestTrades.length === 0 && <tr><td colspan="5" class="empty">暂无记录 —— 运行 <code>npm run backtest</code></td></tr>}
         </tbody>
       </table>
-    </div>
-  </div>
-
-  <div class="note" style="margin-top:12px">
-    <span class="ic">◇</span>
-    <div>
-      live 模式上线后，RFQ 真实成交会记在同一张表的 <code>mode = live</code> 下，并额外带 <code>tx</code> 哈希列 ——
-      纸面与真实的成交共用一套归因口径，这是"回测 → paper → live"三段可对照的前提。
     </div>
   </div>
 

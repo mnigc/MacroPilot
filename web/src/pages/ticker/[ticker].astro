@@ -96,13 +96,14 @@ const fmtUsd = (v: number, d = 0) => `$${Math.abs(v).toLocaleString("en-US", { m
 const fmtSigned = (v: number, d = 0) => `${v >= 0 ? "+" : "−"}${fmtUsd(v, d)}`;
 const fmtPct = (v: number, d = 2) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(d)}%`;
 const cls = (v: number) => (v >= 0 ? "up" : "down");
-const recent = [...marks].reverse().slice(0, 24);
+/** 全部成交，按日期倒序——分页交给前端的 data-paginate，不再截断 */
+const desc = [...marks].reverse();
 const buyCount = marks.length - sells;
 const hi52 = Math.max(...closes.slice(-252));
 const lo52 = Math.min(...closes.slice(-252));
 
 const tiles: { k: string; v: string; s: string; c?: string }[] = [
-  { k: "最新收盘", v: last.toFixed(2), s: `${me?.platform ?? "—"} · ${me?.symbol ?? ""}`, c: cls(dayChg) },
+  { k: "最新收盘", v: last.toFixed(2), s: `收盘日 ${me?.date ?? "—"}`, c: cls(dayChg) },
   { k: "累计买入", v: fmtUsd(buyTotal), s: `${buyCount} 笔 · 含体制与漂移调仓` },
   { k: "已实现盈亏", v: fmtSigned(realizedTotal), s: `${sells} 笔平仓 · 胜率 ${sells ? ((wins / sells) * 100).toFixed(0) : "—"}%`, c: cls(realizedTotal) },
   { k: "浮动盈亏", v: fmtSigned(unrealized), s: `持仓 ${openUnits.toFixed(4)} 股 · 成本 ${avgCost ? avgCost.toFixed(2) : "—"}`, c: cls(unrealized) },
@@ -168,12 +169,12 @@ const tiles: { k: string; v: string; s: string; c?: string }[] = [
     </section>
 
     <section class="panel">
-      <div class="panel-hd"><h2>最近成交</h2><span class="hint">倒序 {recent.length} / {marks.length} 笔</span></div>
+      <div class="panel-hd"><h2>成交明细</h2><span class="hint">按日期倒序 · 共 {marks.length} 笔</span></div>
       <div class="panel-bd flush">
-        <table class="tbl">
+        <table class="tbl" data-paginate>
           <thead><tr><th class="l">日期</th><th class="l">方向</th><th>成交价</th><th>金额</th><th class="r">盈亏</th></tr></thead>
           <tbody>
-            {recent.map((t) => (
+            {desc.map((t) => (
               <tr>
                 <td class="l dim">{t.date}</td>
                 <td class={t.side === "buy" ? "l up" : "l down"}>{t.side === "buy" ? "▲ 买" : "▼ 卖"}</td>

@@ -12,18 +12,23 @@ import {
   getEarningsCoverage,
   getNextEarnings,
   getMacroReadings,
-  getPremiumFriction,
+  getBacktestTurnover,
+  getExecutorRun,
+  getExecutorPreview,
+  getArtifact,
 } from "../lib/db";
+import { existsSync } from "node:fs";
 import { readFileSync } from "node:fs";
 
 const cfg = JSON.parse(readFileSync("../config/strategy.json", "utf8")) as {
   engines: {
     dca: { amountUsdt: number };
-    regime: { scoreHigh: number; scoreLow: number; scoreRelease: number; allocation: Record<string, number>; signals: Record<string, { weight: number }> };
+    regime: { scoreHigh: number; scoreLow: number; scoreRelease: number; allocation: Record<string, number>; gate?: { sahmThreshold: number }; signals: Record<string, { weight: number }> };
+    volTarget?: { targetVol: number };
     drift: { thresholdPp: number };
     earnings: { riskOffDaysBefore: number; scaleFactor: number; restoreDaysAfter: number };
   };
-  execution: { mode: string; startCashUsdt: number };
+  execution: { startCashUsdt: number };
 };
 
 const run = await getLatestRun();
@@ -32,15 +37,20 @@ const regimePoints = run ? await getRegimePoints(run.id) : [];
 const latest = regimePoints.at(-1) ?? null;
 const bands = regimeBands(regimePoints.map((p) => p.date), regimePoints.map((p) => p.regime));
 
-const [board, portfolio, paperTrades, cover, nextEarn, macro, friction] = await Promise.all([
+const [board, portfolio, paperTrades, cover, nextEarn, macro, turnover, executor, preview, analog] = await Promise.all([
   getTickerBoard(tickers),
   getPortfolio("paper"),
   getTrades("paper", 200),
   getEarningsCoverage(tickers),
   getNextEarnings(tickers),
   getMacroReadings(),
-  getPremiumFriction("paper"),
+  run ? getBacktestTurnover(run.id) : Promise.resolve(null),
+  getExecutorRun("paper"),
+  getExecutorPreview("paper"),
+  run ? getArtifact<{ windows: { start: string; end: string; distance: number; fwd63: number | null; fwd126: number | null; fwd252: number | null }[]; asOf: string | null; note: string }>(run.id, "analog") : Promise.resolve(null),
 ]);
+/** 估值锚引擎的数据源是否在位（sync-valuation.py 的产物） */
+const capeReady = existsSync("../data/valuation/cape.csv");
 
 const px = Object.fromEntries(board.map((b) => [b.ticker, b]));
 const cash = portfolio.find((p) => p.ticker === "CASH")?.units ?? 0;
@@ -73,7 +83,6 @@ const rows = holdings
 const maxDrift = rows.reduce((m, r) => Math.max(m, Math.abs(r.drift)), 0);
 const drifted = rows.filter((r) => Math.abs(r.drift) > e.drift.thresholdPp).length;
 
-const prem = board.map((b) => b.premium).filter((v): v is number => v !== null);const avgPremium = prem.length ? prem.reduce((a, b) => a + b, 0) / prem.length : null;
 const nextEarnLabel = nextEarn[0] ? `${nextEarn[0].ticker} T-${nextEarn[0].daysAway}` : "—";
 
 const nextFriday = (() => {
@@ -110,6 +119,7 @@ const sigMeta = [
   { key: "volatility", name: "波动率", series: "VIXCLS", w: e.regime.signals.volatility.weight, desc: "VIX 水平 70% + 1 月趋势 30%（低波动加分）", fmt: (v: number) => v.toFixed(2) },
   { key: "rates", name: "利率", series: "DGS10", w: e.regime.signals.rates.weight, desc: "10Y 收益率 13 周变化（下行加分）", fmt: (v: number) => `${v.toFixed(2)}%` },
   { key: "trend", name: "趋势", series: "SP500", w: e.regime.signals.trend.weight, desc: "标普 500 相对 200 日均线的位置", fmt: (v: number) => v.toFixed(0) },
+  { key: "credit", name: "信用", series: "BAMLH0A0HYM2", w: e.regime.signals.credit?.weight ?? 0.2, desc: "高收益信用利差：水平 70% + 13 周变化 30%（收紧减分）", fmt: (v: number) => `${v.toFixed(2)}pp` },
 ] as const;
 
 const fmtUsd = (v: number) => `$${v.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
@@ -117,19 +127,61 @@ const fmtPct = (v: number, d = 1) => `${(v * 100).toFixed(d)}%`;
 const sigColor = (v: number) => (v >= 0.6 ? "up" : v <= 0.4 ? "down" : "yel");
 const sigValues: Record<string, number> = latest ? { ...latest.signals } : {};
 
+/**
+ * 风险读数。都从库里现算，没有一项是"估算"：
+ *  · 回撤/换手来自回测 run（Σ|成交额| 由 SQL 聚合，不能用有 limit 的 getTrades，否则会偏小）。
+ */
+const years = (() => {
+  const s = run?.equity.strategy ?? [];
+  const [a, z] = [s[0]?.date, s.at(-1)?.date];
+  return a && z ? (Date.parse(z) - Date.parse(a)) / 31_557_600_000 : 0;
+})();
+const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+const avgEquity = mean((run?.equity.strategy ?? []).map((p) => p.value));
+const avgBench = mean((run?.equity.benchmark ?? []).map((p) => p.value));
+/** 年化单边换手 = Σ|成交额| ÷ 2 ÷ 平均净值 ÷ 年数 */
+const turnoverStrategy = turnover && years > 0 && avgEquity > 0 ? turnover.gross / 2 / avgEquity / years : null;
+/** 买入持有只买不卖，所以它的单边成交额就是累计投入（首笔 + 每周定投） */
+const turnoverBench =
+  years > 0 && avgBench > 0 ? (startCash + e.dca.amountUsdt * 52 * years) / avgBench / years : null;
+const ddShrink = run && run.metrics.benchmark.maxDrawdown ? Math.abs(run.metrics.strategy.maxDrawdown / run.metrics.benchmark.maxDrawdown) : null;
+
+const execAgeH = executor ? (Date.now() - Date.parse(executor.at)) / 3_600_000 : null;
+const execChip = execAgeH === null ? "" : execAgeH <= 30 ? "ok" : execAgeH <= 54 ? "warn" : "bad";
+const execAgeLabel = execAgeH === null ? "未运行" : execAgeH < 1 ? `${Math.round(execAgeH * 60)} 分钟前` : execAgeH < 48 ? `${execAgeH.toFixed(0)} 小时前` : `${(execAgeH / 24).toFixed(1)} 天前`;
+
 /** 状态行里的数字加粗：string 是说明文字，{b} 是读数 */
 type Tok = string | { b: string; cls?: string };
 
+const volMultNow = preview?.composition.volMult ?? null;
+const tiltNow = preview?.composition.tilt ?? null;
+
 const engines: { cls: string; name: string; rule: string; icon: string; state: Tok[] }[] = [
   {
-    cls: "y", name: "定投引擎", rule: `每周五 13:00 UTC 注入 ${fmtUsd(e.dca.amountUsdt)}，按当期目标权重买入`,
+    cls: "y", name: "定投引擎", rule: `每周五注入 ${fmtUsd(e.dca.amountUsdt)}，按当期目标权重买入`,
     icon: '<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>',
     state: ["下次 ", { b: nextFriday }, " · 已执行 ", { b: String(dcaCount) }, " 次"],
   },
   {
-    cls: "g", name: "体制引擎", rule: "四信号百分位加权 → 综合分 → 三态滞回决定总仓位",
+    cls: "g", name: "体制引擎", rule: "五信号百分位加权 → 综合分 → 三态滞回决定总仓位",
     icon: '<circle cx="12" cy="12" r="9"/><path d="M12 12l4.5-4.5"/><path d="M12 21v-3"/>',
     state: [`${REGIME_LABEL[regime]} `, { b: `${((latest?.equity_target ?? 0) * 100).toFixed(0)}%` }, ` · ${edge.label} `, { b: edge.v.toFixed(3) }, " · 近 90 天切换 ", { b: String(switches90) }, " 次"],
+  },
+  {
+    cls: "b", name: "波动率目标", rule: `${e.volTarget ? (e.volTarget.targetVol * 100).toFixed(0) : 15}% 已实现波动之上按比例减仓（不杠杆）`,
+    icon: '<path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/>',
+    state: volMultNow === null
+      ? ["乘数 ", { b: "—" }, " · 无读数（按 1 处理）"]
+      : ["乘数 ", { b: `×${volMultNow.toFixed(2)}`, cls: volMultNow < 0.9 ? "down" : "up" }, ` · 目标仓位贡献 ${((volMultNow - 1) * 100).toFixed(0)}%`],
+  },
+  {
+    cls: capeReady ? "p" : "w", name: "估值锚", rule: "CAPE 滚动百分位 → ±15% 线性偏移（贵时少买，便宜时多买）",
+    icon: '<path d="M12 2v20M2 12h20"/><circle cx="12" cy="12" r="9"/>',
+    state: !capeReady
+      ? [{ b: "⚠ CAPE 未同步", cls: "down" }, "，引擎按关闭处理"]
+      : tiltNow === null
+        ? ["偏移 ", { b: "—" }, " · 无读数"]
+        : ["偏移 ", { b: `${tiltNow >= 0 ? "+" : ""}${(tiltNow * 100).toFixed(1)}%`, cls: tiltNow >= 0 ? "up" : "down" }, " · 贵时收敛、便宜时扩张"],
   },
   {
     cls: "p", name: "漂移引擎", rule: `任一标的权重偏离目标 ±${e.drift.thresholdPp}pp 即拉回，抑制磨损`,
@@ -145,10 +197,10 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
   },
 ];
 ---
-<Base active="dash" crumb="投顾仪表盘" sub="四引擎 → 一张目标权重表 → 一个链上执行器">
+<Base active="dash" crumb="投顾仪表盘" sub="六模块 → 一张目标权重表 → 一个纸面执行器">
   <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
     <span class:list={["badge", regime]}><span class="dot"></span>{REGIME_LABEL[regime]} · {score.toFixed(3)}</span>
-    <span class="chip">{cfg.execution.mode === "paper" ? "纸面账户" : "真实资金"}</span>
+    <span class="chip">纸面账户</span>
   </div>
 
   <div class="tiles">
@@ -160,10 +212,10 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
     <div class="tile">
       <div class="tile-k">目标股票仓位</div>
       <div class="tile-v yel">{((latest?.equity_target ?? 0) * 100).toFixed(0)}%</div>
-      <div class="tile-s">risk-on {(e.regime.allocation.riskOn * 100).toFixed(0)}% / 中性 {(e.regime.allocation.neutral * 100).toFixed(0)}% / 防御 {(e.regime.allocation.riskOff * 100).toFixed(0)}%</div>
+      <div class="tile-s">体制档 {(e.regime.allocation.riskOn * 100).toFixed(0)}% / {(e.regime.allocation.neutral * 100).toFixed(0)}% / {(e.regime.allocation.riskOff * 100).toFixed(0)}% · 合成 {preview ? `${((preview.composition.final ?? 0) * 100).toFixed(0)}%` : "—"}</div>
     </div>
     <div class="tile">
-      <div class="tile-k">资金分布 · 股票 / 稳定币</div>
+      <div class="tile-k">资金分布 · 股票 / 现金</div>
       <div class="tile-v sm">{fmtUsd(equity - cash)} <span class="faint">/</span> {fmtUsd(cash)}</div>
       <div class="bar lg" style="margin-top:8px"><i style={`width:${((equity - cash) / (equity || 1)) * 100}%`}></i></div>
     </div>
@@ -177,15 +229,24 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
       <div class="tile-v sm">{nextEarnLabel}</div>
       <div class="tile-s">{nextEarn[0]?.date ?? "日历未同步"} · 窗口 {e.earnings.riskOffDaysBefore} 天</div>
     </div>
+  </div>
+
+  <div class="faint" style="margin:14px 0 6px">
+    风险读数 · 与上排同源，全部实测：回测 run #{run?.id ?? "—"}、paper 账本
+  </div>
+  <div class="tiles">
     <div class="tile">
-      <div class="tile-k">链上平均溢价</div>
-      <div class:list={["tile-v", "sm", avgPremium === null ? "" : avgPremium >= 0 ? "down" : "up"]}>
-        {avgPremium === null ? "—" : `${(avgPremium * 100).toFixed(3)}%`}
-      </div>
+      <div class="tile-k">最大回撤 · 策略 / 买入持有</div>
+      <div class="tile-v down">{run ? fmtPct(run.metrics.strategy.maxDrawdown) : "—"}</div>
       <div class="tile-s">
-        {friction
-          ? `已按此价成交 ${friction.fills} 笔 · 累计${friction.usd >= 0 ? "多付" : "多收"} ${fmtUsd(Math.abs(friction.usd))}`
-          : "paper 成交尚未叠加溢价"} · <a href="/spread">详情</a>
+        基准 {run ? fmtPct(run.metrics.benchmark.maxDrawdown) : "—"} · 峰值回撤压缩到 {ddShrink === null ? "—" : `${(ddShrink * 100).toFixed(0)}%`}
+      </div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">年化单边换手</div>
+      <div class="tile-v sm">{turnoverStrategy === null ? "—" : `${turnoverStrategy.toFixed(2)}×`}</div>
+      <div class="tile-s">
+        买入持有 ≈{turnoverBench === null ? "—" : `${turnoverBench.toFixed(2)}×`} · Σ|成交额| ÷ 2 ÷ 平均净值
       </div>
     </div>
   </div>
@@ -205,11 +266,12 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
       </div>
       <div class="panel-bd">
         <div class="gauge">
-          <div class="gauge-score">
-            <span class="big">{score.toFixed(3)}</span>
-            <span class:list={["badge", regime]}><span class="dot"></span>{REGIME_LABEL[regime]}</span>
-            <span class="faint" style="margin-left:auto">{edge.label} <b class="mono">{edge.v.toFixed(3)}</b></span>
-          </div>
+        <div class="gauge-score">
+          <span class="big">{score.toFixed(3)}</span>
+          <span class:list={["badge", regime]}><span class="dot"></span>{REGIME_LABEL[regime]}</span>
+          {preview?.gateActive && <span class="chip bad" title={`Sahm 规则读数 ${preview.sahm?.toFixed(2)}pp ≥ 阈值（失业率 3 个月均值 − 12 个月低点）`}>⚠ Sahm 门 · 仓位压回防御档</span>}
+          <span class="faint" style="margin-left:auto">{edge.label} <b class="mono">{edge.v.toFixed(3)}</b></span>
+        </div>
           <div class="gauge-track">
             <div class="gauge-needle" style={`left:${Math.max(0, Math.min(100, score * 100))}%`}></div>
           </div>
@@ -267,6 +329,85 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
     </div>
   </div>
 
+  <div class="grid g-2" style="margin-top:12px">
+    <div class="panel">
+      <div class="panel-hd">
+        <h2>下一轮预告</h2><span class="hint">规则确定性 → 下轮动作可提前算出（npm run agent --dry-run 同源）</span>
+        <div class="right">{preview && <span class="faint">截至 {preview.asOf}</span>}</div>
+      </div>
+      <div class="panel-bd">
+        {preview ? (
+          <>
+            <div class="tiles" style="grid-template-columns:repeat(3,1fr)">
+              <div class="tile">
+                <div class="tile-k">目标仓位合成</div>
+                <div class="tile-v sm">{((preview.composition.final ?? 0) * 100).toFixed(0)}%</div>
+                <div class="tile-s">体制 {(preview.composition.regimeTarget * 100).toFixed(0)}% × 波动率 {preview.composition.volMult !== null ? `×${preview.composition.volMult.toFixed(2)}` : "×—"}{preview.composition.tilt !== null ? ` × (1${preview.composition.tilt >= 0 ? "+" : ""}${(preview.composition.tilt * 100).toFixed(1)}%)` : ""}</div>
+              </div>
+              <div class="tile">
+                <div class="tile-k">下轮定投 {preview.nextFriday?.date ?? "—"}</div>
+                <div class="tile-v sm">${preview.nextFriday?.injectionUsdt ?? 0}</div>
+                <div class="tile-s">{preview.nextFriday?.planned.map((p) => `${p.ticker} $${p.usdt}`).join(" · ") || "—"}</div>
+              </div>
+              <div class="tile">
+                <div class="tile-k">未来 14 天财报</div>
+                <div class="tile-v sm">{preview.earningsNext14d.length || "0"} 场</div>
+                <div class="tile-s">{preview.earningsNext14d.map((x) => `${x.ticker} ${x.date}`).join(" · ") || "窗口外，无避险动作"}</div>
+              </div>
+            </div>
+            <div class="sep"></div>
+            <div class="faint" style="margin-bottom:6px">漂移读数（±{e.drift.thresholdPp}pp 触发拉回；>60% 阈值预标黄）</div>
+            {preview.drifts.map((d) => {
+              const hot = Math.abs(d.driftPp) > d.thresholdPp;
+              const warm = !hot && Math.abs(d.driftPp) > d.thresholdPp * 0.6;
+              return (
+                <div class="sig" style="grid-template-columns:64px 1fr 90px">
+                  <div class="n">{d.ticker}</div>
+                  <div class="bar"><i style={`width:${Math.min(100, (Math.abs(d.driftPp) / (d.thresholdPp * 1.5)) * 100)}%;background:var(--${hot ? "down" : warm ? "yellow" : "blue"})`}></i></div>
+                  <div class="v" style={`color:var(--${hot ? "down" : warm ? "yellow" : "text-3"})`}>{d.driftPp >= 0 ? "+" : ""}{d.driftPp.toFixed(2)}pp</div>
+                </div>
+              );
+            })}
+          </>
+        ) : (
+          <div class="empty">还没有执行预告 —— 跑一轮 <code>npm run agent</code> 后生成</div>
+        )}
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <h2>历史类比</h2><span class="hint">宏观综合分形态最像现在的历史窗口 · 之后发生了什么</span>
+        <div class="right">{analog?.asOf && <span class="faint">当前窗口截至 {analog.asOf}</span>}</div>
+      </div>
+      <div class="panel-bd flush">
+        {analog && analog.windows.length ? (
+          <table class="tbl">
+            <thead><tr><th class="l">窗口</th><th>相似度</th><th>后 3 月</th><th>后 6 月</th><th>后 12 月</th></tr></thead>
+            <tbody>
+              {analog.windows.map((w) => (
+                <tr>
+                  <td class="l dim">{w.start} → {w.end}</td>
+                  <td class="dim">{w.distance.toFixed(3)}</td>
+                  <td class={w.fwd63 === null ? "faint" : w.fwd63 >= 0 ? "up" : "down"}>{w.fwd63 === null ? "—" : fmtPct(w.fwd63)}</td>
+                  <td class={w.fwd126 === null ? "faint" : w.fwd126 >= 0 ? "up" : "down"}>{w.fwd126 === null ? "—" : fmtPct(w.fwd126)}</td>
+                  <td class={w.fwd252 === null ? "faint" : w.fwd252 >= 0 ? "up" : "down"}>{w.fwd252 === null ? "—" : fmtPct(w.fwd252)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <div class="empty">暂无类比数据 —— 跑一轮 <code>npm run backtest</code> 生成</div>
+        )}
+      </div>
+      <div class="panel-bd" style="padding-top:0">
+        <div class="faint" style="line-height:1.65">
+          {analog?.note ?? "在综合分历史里找与最近 60 天最相似的窗口，远期收益取买入持有口径。"}这是条件化的历史统计——<b>不是预测</b>。
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="grid g-4" style="margin-top:12px">
     {engines.map((eng) => (
       <div class="eng">
@@ -289,13 +430,13 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
       <div class="panel-bd flush">
         <table class="tbl">
           <thead>
-            <tr><th class="l">标的</th><th>持仓</th><th>收盘价</th><th>市值</th><th>权重</th><th>目标</th><th>偏离</th><th class="l">链上溢价</th></tr>
+            <tr><th class="l">标的</th><th>持仓</th><th>收盘价</th><th>市值</th><th>权重</th><th>目标</th><th>偏离</th></tr>
           </thead>
           <tbody>
             {rows.map((r) => (
               <tr>
                 <td class="l t">
-                  <div class="sym"><a class="tk" href={`/ticker/${r.ticker}`}>{r.ticker}</a>{r.b?.symbol && <i>{r.b.symbol} · {r.b.platform}</i>}{inWindow(r.ticker) && <span class="pill earnings">财报窗口</span>}</div>
+                  <div class="sym"><a class="tk" href={`/ticker/${r.ticker}`}>{r.ticker}</a>{inWindow(r.ticker) && <span class="pill earnings">财报窗口</span>}</div>
                 </td>
                 <td>{r.units.toFixed(4)}</td>
                 <td>{r.close.toFixed(2)}</td>
@@ -303,20 +444,18 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
                 <td>{fmtPct(r.weight, 2)}</td>
                 <td class="dim">{fmtPct(r.tgt, 2)}</td>
                 <td class={Math.abs(r.drift) > e.drift.thresholdPp ? "down strong" : Math.abs(r.drift) > 1 ? "yel" : "dim"}>{r.drift >= 0 ? "+" : ""}{r.drift.toFixed(2)}pp</td>
-                <td class="l">{r.b?.premium === null || r.b?.premium === undefined ? <span class="faint">—</span> : <span class={r.b.premium >= 0 ? "down" : "up"}>{(r.b.premium * 100).toFixed(3)}%</span>}</td>
               </tr>
             ))}
           </tbody>
           <tfoot>
             <tr>
-              <td class="l t"><div class="sym"><b>USDT</b><i>稳定币腿 · 等待部署</i></div></td>
+              <td class="l t"><div class="sym"><b>现金</b><i>等待部署</i></div></td>
               <td class="dim">—</td>
               <td class="dim">1.00</td>
               <td class="strong">{fmtUsd(cash)}</td>
               <td>{fmtPct(cashWeight, 2)}</td>
               <td class="dim">{fmtPct(cashTarget, 2)}</td>
               <td class={Math.abs(cashWeight - cashTarget) > e.drift.thresholdPp ? "down strong" : "dim"}>{cashWeight - cashTarget >= 0 ? "+" : ""}{((cashWeight - cashTarget) * 100).toFixed(2)}pp</td>
-              <td class="l faint">—</td>
             </tr>
           </tfoot>
         </table>
@@ -365,7 +504,12 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
   <div class="panel" style="margin-top:12px">
     <div class="panel-hd">
       <h2>最近交易</h2><span class="hint">paper 执行记录 · 逐笔标注全部触发引擎</span>
-      <div class="right"><a href="/trades" class="chip">全部 {paperTrades.length} 笔 →</a></div>
+      <div class="right">
+        <span class:list={["chip", execChip]} title="runtime_state.updated_at：每跑完一轮就写一次，停在上一轮说明守卫拦下了">
+          上一轮 {executor ? `${executor.at.slice(5, 16).replace("T", " ")}Z` : "未运行"} · {execAgeLabel}
+        </span>
+        <a href="/trades" class="chip">全部 {paperTrades.length} 笔 →</a>
+      </div>
     </div>
     <div class="panel-bd flush">
       <table class="tbl">

@@ -26,10 +26,10 @@ export interface RunRow {
   generated_at: Date;
   tickers: string[];
   params: Record<string, unknown>;
-  metrics: { strategy: RunMetrics; benchmark: RunMetrics };
+  metrics: { strategy: RunMetrics; benchmark: RunMetrics; benchmark6040?: RunMetrics };
   regime_days: Record<string, number>;
   final_weights: Record<string, number>;
-  equity: { strategy: ChartPoint[]; benchmark: ChartPoint[] };
+  equity: { strategy: ChartPoint[]; benchmark: ChartPoint[]; benchmark6040?: ChartPoint[] };
 }
 
 export interface RunMetrics {
@@ -37,6 +37,7 @@ export interface RunMetrics {
   cagr: number;
   maxDrawdown: number;
   sharpe: number;
+  annualVol?: number;
 }
 
 export interface ChartPoint {
@@ -49,7 +50,7 @@ export interface RegimePointRow {
   score: number;
   regime: string;
   equity_target: number;
-  signals: { liquidity: number; volatility: number; rates: number; trend: number };
+  signals: { liquidity: number; volatility: number; rates: number; trend: number; credit?: number };
 }
 
 export interface TradeRow {
@@ -59,8 +60,14 @@ export interface TradeRow {
   units_delta: number;
   notional_usdt: number;
   reason: string;
-  /** paper 成交叠加的链上溢价；live 与 backtest 为 null（真实报价/回测口径里不含这一项） */
-  premium?: number | null;
+  /**
+   * 落库时刻（UTC，MM-DD HH:MM:SS）。paper 下它同时是成交时刻——一轮跑完即写库；
+   * **backtest 下它没有意义**（8508 行是回填时一次性插入的，时刻全落在回填那一分钟），
+   * 所以界面只在 paper 流水里显示这一列。
+   */
+  createdAt?: string;
+  /** 该笔计提的单边成本（美元）；2026-09-28 之前的记录为 0 */
+  costUsdt?: number;
 }
 
 export async function getLatestRun(): Promise<RunRow | null> {
@@ -85,7 +92,10 @@ export async function getRegimePoints(runId: number): Promise<RegimePointRow[]> 
 export async function getTrades(mode: string, limit = 100): Promise<TradeRow[]> {
   return cached(`trades:${mode}:${limit}`, async () => {
     const { rows } = await db.query<TradeRow>(
-      "select mode, to_char(date, 'YYYY-MM-DD') as date, ticker, units_delta, notional_usdt, reason, premium from trades where mode = $1 order by date desc, id desc limit $2",
+      `select mode, to_char(date, 'YYYY-MM-DD') as date, ticker, units_delta, notional_usdt, reason,
+              coalesce(cost_usdt, 0)::float as "costUsdt",
+              to_char(created_at at time zone 'UTC', 'MM-DD HH24:MI:SS') as "createdAt"
+       from trades where mode = $1 order by date desc, created_at desc, id desc limit $2`,
       [mode, limit],
     );
     return rows;
@@ -114,21 +124,40 @@ export async function getPortfolio(mode: string): Promise<{ ticker: string; unit
   });
 }
 
+/**
+ * 一次性拿到整轮回测的成交额拆分。换手率必须从库里聚合，不能走 getTrades——
+ * 那个函数有 limit，而 run #14 有 2202 笔，截断后算出的换手会悄悄偏小。
+ */
+export interface Turnover {
+  /** Σ|成交额|，双边口径 */
+  gross: number;
+  fills: number;
+  buys: number;
+  sells: number;
+}
+
+export async function getBacktestTurnover(runId: number): Promise<Turnover | null> {
+  return cached(`turnover:${runId}`, async () => {
+    const { rows } = await db.query<Turnover>(
+      `select coalesce(sum(abs(notional_usdt)), 0)::float as gross,
+              count(*)::int as fills,
+              coalesce(sum(case when units_delta > 0 then notional_usdt else 0 end), 0)::float as buys,
+              coalesce(sum(case when units_delta < 0 then abs(notional_usdt) else 0 end), 0)::float as sells
+       from trades where mode = 'backtest' and run_id = $1`,
+      [runId],
+    );
+    return rows[0] ?? null;
+  });
+}
+
 export interface BoardRow {
   ticker: string;
   date: string;
   close: number;
   prevClose: number | null;
-  symbol: string | null;
-  platform: string | null;
-  premium: number | null;
-  impactPct: number | null;
 }
 
-/**
- * 行情条：每股最新收盘价、较前一交易日涨跌、以及最近一轮链上可成交溢价。
- * 把三者放一行是刻意的——收盘价是"应该付多少"，溢价是"链上实际付多少"。
- */
+/** 行情条：每股最新收盘价与较前一交易日的涨跌 */
 export async function getTickerBoard(tickers: string[]): Promise<BoardRow[]> {
   return cached(`board:${tickers.join(",")}`, async () => {
     const { rows } = await db.query<BoardRow>(
@@ -136,16 +165,10 @@ export async function getTickerBoard(tickers: string[]): Promise<BoardRow[]> {
          select ticker, date::text as d, close,
                 row_number() over (partition by ticker order by date desc) rn
          from prices where ticker = any($1)
-       ),
-       snap as (
-         select distinct on (ticker) ticker, symbol, platform, premium, impact_pct
-         from rwa_premiums order by ticker, captured_at desc
        )
-       select a.ticker, a.d as date, a.close, b.close as "prevClose",
-              s.symbol, s.platform, s.premium, s.impact_pct as "impactPct"
+       select a.ticker, a.d as date, a.close, b.close as "prevClose"
        from r a
        left join r b on b.ticker = a.ticker and b.rn = 2
-       left join snap s on s.ticker = a.ticker
        where a.rn = 1
        order by a.ticker`,
       [tickers],
@@ -188,7 +211,7 @@ export async function getMacroReadings(): Promise<Record<string, MacroReading>> 
                    where v4.series = l.series and v4.date < l.date
                    order by v4.date desc limit 200) v3) as "sma200"
        from latest l`,
-      [["WALCL", "VIXCLS", "DGS10", "SP500"]],
+      [["WALCL", "VIXCLS", "DGS10", "SP500", "BAMLH0A0HYM2", "UNRATE"]],
     );
     return Object.fromEntries(
       rows.map((r) => [r.series, { series: r.series, asOf: r.asOf, value: r.value, prevQ: r.prevQ === null ? null : Number(r.prevQ), sma200: r.sma200 === null ? null : Number(r.sma200) }]),
@@ -234,126 +257,28 @@ export async function getNextEarnings(tickers: string[]): Promise<NextEarnings[]
   });
 }
 
-export interface PremiumRow {
-  ticker: string;
-  symbol: string;
-  platform: string;
-  reference_price: number | null;
-  mark_price: number | null;
-  executable_price: number | null;
-  premium: number | null;
-  impact_pct: number | null;
-  vendor: string | null;
-  dex: string | null;
+export interface ExecutorRun {
+  /** 最近一轮执行写入 runtime_state 的时刻（UTC，ISO 带 Z，便于直接算距今）——每轮都会 upsert，等于心跳 */
+  at: string;
+  /** 那一轮据以决策的数据日 */
+  asOf: string;
 }
 
 /**
- * 最近一轮"链上可成交溢价"快照。
- * 数据端点给的是发行方净值标记（tokenPrice ≡ 参考价 × 份额比），没有盘口；
- * 这里的 premium 来自聚合器询价出的可成交单价，才是真信号。
+ * 执行器心跳。runtime_state 每轮都会写，所以它的 updated_at 就是"上次真正跑完一轮"的时刻；
+ * 若某轮在守卫处硬失败（如宏观序列断供），这里会停在上一轮——这正是要显示的信号，
+ * 而不是拿股价的 as_of 冒充"执行器刚刚跑过"。
  */
-export async function getLatestPremiums(): Promise<{ capturedAt: string; rows: PremiumRow[]; snapshots: number } | null> {
-  return cached("latestPremiums", async () => {
-    const head = await db.query<{ captured_at: Date; n: string }>(
-      `select captured_at, count(*)::text as n from rwa_premiums group by captured_at order by captured_at desc limit 1`,
-    );
-    const first = head.rows[0];
-    if (!first) return null;
-    const { rows } = await db.query<PremiumRow>(
-      `select ticker, symbol, platform, reference_price, mark_price, executable_price, premium, impact_pct, vendor, dex
-       from rwa_premiums where captured_at = $1 order by premium desc nulls last`,
-      [first.captured_at],
-    );
-    const total = await db.query<{ n: string }>("select count(distinct captured_at)::text as n from rwa_premiums");
-    return { capturedAt: first.captured_at.toISOString(), rows, snapshots: Number(total.rows[0]?.n ?? 0) };
-  });
-}
-
-/**
- * 日线口径的溢价历史：链上 1d 收盘 ÷ 份额比 vs **同一天**的美股收盘。
- *
- * 与上面 getLatestPremiums 的询价口径是两条独立证据，不能并成一条线：
- * 那条读的是聚合器盘口（真能成交，但只有当下一个点、且只有几天快照），
- * 这条读的是官方分钟线聚出的日线（可回溯约一年，但没有盘口，算不出冲击成本）。
- * 只保留两边同日均有读数的日期 —— 链上 7×24、美股有休市，缺任何一边都除不出溢价。
- */
-export interface PremiumHistoryRow {
-  ticker: string;
-  date: string;
-  /** 链上价折算到每股（USDT） */
-  onchain: number;
-  /** 同日美股官方收盘参考价（USD） */
-  reference: number;
-  premium: number;
-}
-
-export async function getPremiumHistory(tickers: string[], days = 400): Promise<PremiumHistoryRow[]> {
-  return cached(`premiumHistory:${tickers.join(",")}:${days}`, async () => {
-    const { rows } = await db.query<PremiumHistoryRow>(
-      `select c.ticker, to_char(c.date, 'YYYY-MM-DD') as date,
-              c.close / nullif(c.share_ratio, 0) as onchain,
-              p.close as reference,
-              c.close / nullif(c.share_ratio, 0) / nullif(p.close, 0) - 1 as premium
-       from rwa_candles c
-       join prices p on p.ticker = c.ticker and p.date = c.date
-       where c.ticker = any($1) and c.date >= current_date - $2::int
-         and c.share_ratio > 0 and p.close > 0
-       order by c.ticker, c.date`,
-      [tickers, days],
-    );
-    return rows;
-  });
-}
-
-/**
- * 最近一轮采集的官方分钟蜡烛（300 根 1 分钟）。库里唯一带 volume 的一路，
- * 所以它负责回答"链上到底有没有人在买卖"；溢价仍只看日线与询价两条口径。
- */
-export interface TickRow {
-  ticker: string;
-  /** bar 开盘时间（epoch 毫秒）。源站按 bigint 返回，pg 驱动会给字符串，故在 SQL 里转 float8 */
-  openTime: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-  shareRatio: number;
-  capturedAt: string;
-}
-
-export async function getLatestTicks(): Promise<TickRow[]> {
-  return cached("latestTicks", async () => {
-    const { rows } = await db.query<TickRow>(
-      `select ticker, open_time::float8 as "openTime", open, high, low, close, volume, share_ratio as "shareRatio",
-              to_char((select max(captured_at) from rwa_ticks) at time zone 'UTC', 'YYYY-MM-DD HH24:MI') as "capturedAt"
-       from rwa_ticks order by ticker, open_time`,
-    );
-    return rows;
-  });
-}
-
-/**
- * 累计链上溢价摩擦：账本按"参考价 × (1+溢价)"付出/收到现金，却仍按参考价给持仓估值，
- * 两者之差就是"在链上买美股"相对直接买美股的真实成本。逐笔算再合计：
- *   每股差额 = 参考价 × 溢价 = notional/(1+溢价) × 溢价
- * 买入记为成本（正），卖出记为收益（负），所以带上 units_delta 的符号。
- */
-export async function getPremiumFriction(
-  mode: string,
-): Promise<{ usd: number; fills: number; notional: number } | null> {
-  return cached(`premiumFriction:${mode}`, async () => {
-    const { rows } = await db.query<{ usd: number | null; n: string; notional: number | null }>(
-      `select coalesce(sum(case when units_delta > 0 then 1 else -1 end * notional_usdt * premium / (1 + premium)), 0)::float as usd,
-              count(*)::text as n,
-              coalesce(sum(notional_usdt), 0)::float as notional
-       from trades where mode = $1 and premium is not null`,
+export async function getExecutorRun(mode: string): Promise<ExecutorRun | null> {
+  return cached(`executorRun:${mode}`, async () => {
+    const { rows } = await db.query<ExecutorRun>(
+      `select to_char(max(updated_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as "at",
+              max(as_of)::text as "asOf"
+       from runtime_state where mode = $1`,
       [mode],
     );
     const r = rows[0];
-    const fills = Number(r?.n ?? 0);
-    if (!fills) return null;
-    return { usd: r?.usd ?? 0, fills, notional: r?.notional ?? 0 };
+    return r?.at ? r : null;
   });
 }
 
@@ -361,8 +286,8 @@ export interface Freshness {
   prices: { asOf: string | null; tickers: number };
   /** 宏观时间线的最后一个交易日——FRED 滞后于股价，这个日期通常比 prices 旧 */
   macro: { asOf: string | null; runId: number | null };
-  agent: { asOf: string | null; mode: string | null };
-  premium: { capturedAt: string | null; snapshots: number };
+  /** asOf 是决策依据的数据日，at 是执行器真正写入心跳的时刻（UTC，含时分秒） */
+  agent: { asOf: string | null; at: string | null; mode: string | null };
 }
 
 /**
@@ -371,7 +296,7 @@ export interface Freshness {
  */
 export async function getFreshness(): Promise<Freshness> {
   return cached("freshness", async () => {
-    const [prices, macro, agent, premium] = await Promise.all([
+    const [prices, macro, agent] = await Promise.all([
       db.query<{ asOf: string | null; n: string }>(
         `select max(date)::text as "asOf", count(distinct ticker)::text as n from prices`,
       ),
@@ -379,21 +304,95 @@ export async function getFreshness(): Promise<Freshness> {
         `select to_char(max(date), 'YYYY-MM-DD') as "asOf", max(run_id) as run
          from regime_points where run_id = (select max(id) from backtest_runs)`,
       ),
-      db.query<{ asOf: string | null; mode: string | null }>(
-        `select to_char(max(as_of), 'YYYY-MM-DD') as "asOf", max(mode) as mode from runtime_state`,
-      ),
-      db.query<{ captured: string | null; n: string }>(
-        "select max(captured_at)::text as captured, count(distinct captured_at)::text as n from rwa_premiums",
+      db.query<{ asOf: string | null; at: string | null; mode: string | null }>(
+        `select to_char(max(as_of), 'YYYY-MM-DD') as "asOf",
+                to_char(max(updated_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as "at",
+                max(mode) as mode from runtime_state`,
       ),
     ]);
     return {
       prices: { asOf: prices.rows[0]?.asOf ?? null, tickers: Number(prices.rows[0]?.n ?? 0) },
       macro: { asOf: macro.rows[0]?.asOf ?? null, runId: macro.rows[0]?.run ?? null },
-      agent: { asOf: agent.rows[0]?.asOf ?? null, mode: agent.rows[0]?.mode ?? null },
-      premium: {
-        capturedAt: premium.rows[0]?.captured ? new Date(premium.rows[0].captured).toISOString() : null,
-        snapshots: Number(premium.rows[0]?.n ?? 0),
-      },
+      agent: { asOf: agent.rows[0]?.asOf ?? null, at: agent.rows[0]?.at ?? null, mode: agent.rows[0]?.mode ?? null },
     };
+  });
+}
+
+/* ---------- 消融实验 / 统计产物 / 执行预告 / 真实账本对照 ---------- */
+
+export interface AblationRow {
+  id: number;
+  variant: string;
+  params: Record<string, unknown>;
+  metrics: { strategy: RunMetrics; benchmark: RunMetrics; benchmark6040?: RunMetrics };
+}
+
+/** 最近一批消融实验（同 batchId 的全部变体），按入库序排列——消融表按"逐层叠加"读差值 */
+export async function getAblationCohort(): Promise<AblationRow[]> {
+  return cached("ablation", async () => {
+    const { rows } = await db.query<AblationRow>(
+      `select id, variant, params, metrics from backtest_runs
+       where variant is not null
+         and params->>'batchId' = (
+           select params->>'batchId' from backtest_runs
+           where variant is not null and params->>'batchId' is not null
+           order by id desc limit 1
+         )
+       order by id`,
+    );
+    return rows;
+  });
+}
+
+/** 回测统计产物（月度矩阵/滚动夏普/自助法/扇形/类比/敏感性/walkforward） */
+export async function getArtifact<T>(runId: number, kind: string): Promise<T | null> {
+  return cached(`artifact:${runId}:${kind}`, async () => {
+    const { rows } = await db.query<{ data: T }>("select data from run_artifacts where run_id = $1 and kind = $2", [runId, kind]);
+    return rows[0]?.data ?? null;
+  });
+}
+
+export interface ExecutorPreview {
+  asOf: string;
+  regime: string;
+  score: number;
+  sahm: number | null;
+  gateActive: boolean;
+  composition: { regimeTarget: number; volMult: number | null; tilt: number | null; final: number };
+  equity: number;
+  drifts: { ticker: string; driftPp: number; thresholdPp: number }[];
+  nextFriday: { date: string; injectionUsdt: number; planned: { ticker: string; usdt: number }[] } | null;
+  earningsNext14d: { ticker: string; date: string }[];
+}
+
+export async function getExecutorPreview(mode: string): Promise<ExecutorPreview | null> {
+  return cached(`preview:${mode}`, async () => {
+    const { rows } = await db.query<{ data: ExecutorPreview }>("select data from executor_preview where mode = $1", [mode]);
+    return rows[0]?.data ?? null;
+  });
+}
+
+export interface RealVsPaperRow {
+  date: string;
+  ticker: string;
+  units_delta: number;
+  realPx: number;
+  paperClose: number;
+}
+
+/** 真实成交 vs 同日纸面收盘：真实滑点的直接证据（真实成交价 − 当日收盘参考价） */
+export async function getRealVsPaper(): Promise<RealVsPaperRow[]> {
+  return cached("realVsPaper", async () => {
+    const { rows } = await db.query<RealVsPaperRow>(
+      `select to_char(t.date, 'YYYY-MM-DD') as date, t.ticker, t.units_delta,
+              (t.notional_usdt / nullif(abs(t.units_delta), 0))::float as "realPx",
+              p.close as "paperClose"
+       from trades t
+       join prices p on p.ticker = t.ticker and p.date = t.date
+       where t.mode = 'real'
+       order by t.date desc, t.ticker
+       limit 200`,
+    );
+    return rows;
   });
 }

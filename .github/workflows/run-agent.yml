@@ -2,11 +2,6 @@ name: run-agent
 
 # 让"永不停歇"这句话成立：执行器与回测由 CI 每天驱动，不依赖有人手动敲命令。
 # 排在 sync-data（UTC 00:30 推价格）之后一小时，保证决策看到的是当日收盘价。
-#
-# 这里刻意**不含**溢价采集（npm run spread）：币安 Web3 API 对 GitHub runner 的
-# 出口 IP 返回 40304 "Service not available due to compliance restriction"，
-# 换 IPv4 也一样被拦，属于合规侧硬拦截而非偶发。rwa_premiums 的采集改由本机计划任务
-# 负责（scripts/capture-premium.ps1），两条链路各自独立、互不阻塞。
 on:
   schedule:
     - cron: "30 1 * * 2-6" # 周二到周六 UTC，对应美股收盘后的次日凌晨
@@ -24,7 +19,6 @@ jobs:
       # 直连主机 db.<ref>.supabase.co 只有 AAAA 记录，而 runner 到那段 AWS IPv6 无路由，
       # 会崩在 connect ENETUNREACH；pooler 有 A 记录，走 IPv4 即可。
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      EXECUTION_MODE: paper # 钉死纸面：这条链路碰真钱，不依赖默认值
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -52,6 +46,6 @@ jobs:
           git add web/public/last-run.txt
           git diff --cached --quiet && { echo "无变化，跳过"; exit 0; }
           git commit -m "chore: agent run $(date -u +%F)"
-          # 与 sync-data / 本机溢价采集的提交可能撞车，rebase 后再推
+          # 与 sync-data 的提交可能撞车，rebase 后再推
           git pull --rebase origin main
           git push origin HEAD:main
