@@ -329,6 +329,29 @@ button.chip:hover { background: rgba(255, 255, 255, 0.09); color: var(--text); }
 .chart.short { height: 240px; }
 .chart.kline { height: 560px; }
 
+/* ---------- 等高行里的"矮"面板：内容纵向铺满，不在底部攒大块空白 ----------
+   网格行内的面板默认等高拉伸，天然矮的一方会留出底部空洞。两种消化方式：
+   · .chart.grow —— 图表吃掉剩余高度（配合 charts.tsx 的 ResizeObserver 重画）；
+   · .tbl.fill  —— 表格把余量均匀摊进行高，行距变疏朗。
+   单列布局（≤1180px）下面板恢复自然高，grow 退化为 min-height 兜底。 */
+.panel { display: flex; flex-direction: column; }
+.panel-bd.grow { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.chart.grow { height: auto; flex: 1 1 0; min-height: 240px; }
+.chart.kline.grow { min-height: 560px; }
+.tbl.fill { height: 100%; }
+
+/* ---------- 置信区间条：lo–hi 区间段 + 点估计 + 买入持有参照刻度 ---------- */
+.ci { display: grid; grid-template-columns: 64px 1fr; gap: 16px 12px; align-items: center; }
+.ci .k { font-size: 12px; color: var(--text-2); }
+.ci .track { position: relative; height: 40px; }
+.ci .rail { position: absolute; left: 0; right: 0; top: 9px; height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.07); }
+.ci .seg { position: absolute; top: 8px; height: 6px; border-radius: 3px; background: var(--yellow-dim); border: 1px solid rgba(252, 213, 53, 0.4); }
+.ci .pt { position: absolute; top: 5px; width: 4px; height: 12px; border-radius: 2px; background: var(--yellow); transform: translateX(-2px); }
+.ci .bench { position: absolute; top: 3px; width: 2px; height: 16px; background: rgba(255, 255, 255, 0.4); transform: translateX(-1px); }
+.ci .cap { position: absolute; top: 22px; font-family: var(--mono); font-size: 10px; color: var(--text-4); }
+.ci .cap.l { left: 0; }
+.ci .cap.r { right: 0; }
+
 .foot { margin-top: 26px; padding-top: 14px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--text-4); font-size: 11.5px; }
 
 @media (max-width: 1180px) {

@@ -85,8 +85,12 @@ function useChart(option: echarts.EChartsOption, deps: unknown[], heightClass: s
     chartRef.current = echarts.init(ref.current);
     const onResize = () => chartRef.current?.resize();
     window.addEventListener("resize", onResize);
+    /** 等高行里 .chart.grow 的容器高度由 flex 决定，窗口没动也会变，必须观测容器自身 */
+    const ro = new ResizeObserver(onResize);
+    ro.observe(ref.current);
     return () => {
       window.removeEventListener("resize", onResize);
+      ro.disconnect();
       chartRef.current?.dispose();
     };
   }, []);
@@ -187,6 +191,8 @@ export function ScoreChart(props: {
   /** 释放阈值：极态回落到 neutral 的内沿，缺省不画 */
   scoreRelease?: number;
   short?: boolean;
+  /** 等高行内吃掉面板剩余高度（.chart.grow），而不是固定 240px */
+  fill?: boolean;
 }) {
   const el = useChart(
     {
@@ -242,7 +248,7 @@ export function ScoreChart(props: {
       ],
     },
     [props.points, props.bands, props.scoreHigh, props.scoreLow, props.scoreRelease],
-    props.short ? "chart short" : "chart",
+    `chart${props.short ? " short" : ""}${props.fill ? " grow" : ""}`,
   );
   return el;
 }
@@ -255,7 +261,7 @@ const SIGNAL_META: { key: string; label: string; color: string }[] = [
   { key: "credit", label: "信用", color: "#ff9f43" },
 ];
 
-export function SignalChart(props: { points: { date: string; signals: Record<string, number> }[] }) {
+export function SignalChart(props: { points: { date: string; signals: Record<string, number> }[]; fill?: boolean }) {
   const el = useChart(
     {
       backgroundColor: "transparent",
@@ -299,7 +305,7 @@ export function SignalChart(props: { points: { date: string; signals: Record<str
       ],
     },
     [props.points],
-    "chart short",
+    `chart short${props.fill ? " grow" : ""}`,
   );
   return el;
 }
@@ -340,6 +346,8 @@ export function KlineChart(props: {
   position: number[];
   trades: KTrade[];
   bands: Band[];
+  /** 等高行内吃掉面板剩余高度，K 线永远比固定 560px 更可用 */
+  fill?: boolean;
 }) {
   const { dates, ohlc, closes, trades } = props;
   const idx = new Map(dates.map((d, i) => [d, i]));
@@ -497,7 +505,7 @@ export function KlineChart(props: {
       ],
     },
     [dates, ohlc, closes, props.position, trades, props.bands],
-    "chart kline",
+    `chart kline${props.fill ? " grow" : ""}`,
   );
   return el;
 }

@@ -8,6 +8,7 @@
  *    DISCORD_WEBHOOK_URL Discord 格式，未配置则跳过）
  */
 import "dotenv/config";
+import { createHash } from "node:crypto";
 import { runOnce, type ExecutorConfig } from "./exec/executor.js";
 import { earningsCalendarStatus } from "./db/index.js";
 import { regimeConfigOf, loadStrategyFile, volTargetConfigOf, valuationConfigOf } from "./backtest/context.js";
@@ -45,6 +46,21 @@ const cfg: ExecutorConfig = {
   valuation: valuationConfigOf(raw),
   cost: raw.execution.cost ?? { halfSpreadBps: 3, impactCoef: 0.35, earningsMult: 1.5 },
   cashInterest: raw.execution.cashInterest ?? true,
+  // 配置签名：影响目标表的全部参数——变更即触发 retarget 对齐，不等漂移阈值
+  configSig: createHash("sha1")
+    .update(
+      JSON.stringify({
+        allocation: raw.engines.regime.allocation,
+        gate: raw.engines.regime.gate ?? null,
+        volTarget: raw.engines.volTarget ?? null,
+        valuation: raw.engines.valuation ?? null,
+        drift: raw.engines.drift,
+        earnings: raw.engines.earnings,
+        tickers: raw.basket.tickers,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 12),
 };
 
 if (dryRun) console.log("—— dry-run：全流程照算，不落任何库 ——\n");
@@ -83,7 +99,7 @@ if (summary.trades.length === 0) {
   let costs = 0;
   for (const t of summary.trades) {
     const drivers = splitDrivers(t.drivers.join(","))
-      .map((d) => ({ seed: "初始建仓", dca: "定投", regime: "体制", volTarget: "波动率", valuation: "估值", drift: "漂移", earnings: "财报" })[d])
+      .map((d) => ({ seed: "初始建仓", dca: "定投", regime: "体制", volTarget: "波动率", valuation: "估值", retarget: "调参", drift: "漂移", earnings: "财报" })[d])
       .join("+");
     costs += t.costUsd;
     console.log(

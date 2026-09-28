@@ -140,9 +140,10 @@ const tiles: { k: string; v: string; s: string; c?: string }[] = [
         <span class="hint">{ohlc ? "日 K · OHLC" : "收盘价折线 · OHLC 待同步"} · 背景色带 = 宏观体制 · 下方蓝区 = 持仓股数</span>
         <div class="right"><span class="faint mono">{dates.length} 根 · {from} → {dates[dates.length - 1]}</span></div>
       </div>
-      <div class="panel-bd">
+      <div class="panel-bd grow">
         <KlineChart
           client:load
+          fill
           dates={dates}
           ohlc={ohlc}
           closes={closes}

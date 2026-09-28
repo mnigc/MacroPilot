@@ -104,6 +104,8 @@ export async function initSchema(): Promise<void> {
       as_of date not null,
       updated_at timestamptz not null default now()
     );
+    -- 策略配置签名：配置变更 → 执行器立即对齐新目标表（retarget），不等漂移阈值
+    alter table runtime_state add column if not exists sig text;
   `);
 }
 
@@ -480,11 +482,13 @@ export interface RuntimeState {
   equityTarget: number;
   score: number;
   asOf: string;
+  /** 策略配置签名；配置变更 → 本轮 retarget 对齐新目标表 */
+  sig?: string | null;
 }
 
 export async function loadRuntimeState(mode: string): Promise<RuntimeState | null> {
   const { rows } = await getPool().query<RuntimeState>(
-    "select regime, equity_target as \"equityTarget\", score, to_char(as_of, 'YYYY-MM-DD') as \"asOf\" from runtime_state where mode = $1",
+    "select regime, equity_target as \"equityTarget\", score, to_char(as_of, 'YYYY-MM-DD') as \"asOf\", sig from runtime_state where mode = $1",
     [mode],
   );
   return rows[0] ?? null;
@@ -492,11 +496,11 @@ export async function loadRuntimeState(mode: string): Promise<RuntimeState | nul
 
 export async function saveRuntimeState(mode: string, state: RuntimeState): Promise<void> {
   await getPool().query(
-    `insert into runtime_state (mode, regime, equity_target, score, as_of, updated_at)
-     values ($1, $2, $3, $4, $5, now())
+    `insert into runtime_state (mode, regime, equity_target, score, as_of, sig, updated_at)
+     values ($1, $2, $3, $4, $5, $6, now())
      on conflict (mode) do update set regime = excluded.regime, equity_target = excluded.equity_target,
-       score = excluded.score, as_of = excluded.as_of, updated_at = now()`,
-    [mode, state.regime, state.equityTarget, state.score, state.asOf],
+       score = excluded.score, as_of = excluded.as_of, sig = excluded.sig, updated_at = now()`,
+    [mode, state.regime, state.equityTarget, state.score, state.asOf, state.sig ?? null],
   );
 }
 

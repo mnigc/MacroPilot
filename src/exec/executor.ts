@@ -57,6 +57,8 @@ export interface ExecutorConfig {
   cashInterest: boolean;
   /** 只算不写：跳过全部持久化，返回值里带完整预告 */
   dryRun?: boolean;
+  /** 策略配置签名：与 runtime_state.sig 不一致 → 本轮立即对齐新目标表（retarget） */
+  configSig?: string;
 }
 
 export interface ExecutionSummary {
@@ -132,6 +134,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   }
   const prevState = await loadRuntimeState(cfg.mode);
   const regimeChanged = prevState !== null && prevState.equityTarget !== regimePoint.equityTarget;
+  const retarget = prevState !== null && cfg.configSig !== undefined && (prevState.sig ?? null) !== cfg.configSig;
 
   // 2) 叠加层：波动率目标乘数（近 22 日收盘）+ 估值锚偏移（CAPE 月度）
   let volMult: number | undefined;
@@ -231,7 +234,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     const preview = buildPreview();
     if (!cfg.dryRun) {
       await savePortfolio(cfg.mode, positions, 0);
-      await saveRuntimeState(cfg.mode, { regime: regimePoint.regime, equityTarget: regimePoint.equityTarget, score: regimePoint.score, asOf });
+      await saveRuntimeState(cfg.mode, { regime: regimePoint.regime, equityTarget: regimePoint.equityTarget, score: regimePoint.score, asOf, sig: cfg.configSig });
       await saveExecutorPreview(cfg.mode, preview);
     }
     return {
@@ -267,6 +270,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   if (seeded) batchDrivers.push("seed");
   if (dcaApplied) batchDrivers.push("dca");
   if (regimeChanged) batchDrivers.push("regime");
+  if (retarget && !seeded) batchDrivers.push("retarget");
   if (drifted.size) batchDrivers.push("drift");
 
   const trades: ExecutionSummary["trades"] = [];
@@ -312,7 +316,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   // 8) 持久化（dry-run 全跳过）
   if (!cfg.dryRun) {
     await savePortfolio(cfg.mode, positions, workingCash);
-    await saveRuntimeState(cfg.mode, { regime: regimePoint.regime, equityTarget: regimePoint.equityTarget, score: regimePoint.score, asOf });
+    await saveRuntimeState(cfg.mode, { regime: regimePoint.regime, equityTarget: regimePoint.equityTarget, score: regimePoint.score, asOf, sig: cfg.configSig });
     if (trades.length) await recordTrades(cfg.mode, trades);
     await saveExecutorPreview(cfg.mode, preview);
   }

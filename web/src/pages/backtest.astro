@@ -140,6 +140,49 @@ const sensCellA = (h: number, l: number) => sensitivity?.gridThreshold.find((g) 
 const volRows = sensitivity ? [...new Set(sensitivity.gridVolDrift.map((g) => g.targetVol))].sort((a, b) => a - b) : [];
 const driftCols = sensitivity ? [...new Set(sensitivity.gridVolDrift.map((g) => g.driftPp))].sort((a, b) => a - b) : [];
 const sensCellB = (tv: number, dp: number) => sensitivity?.gridVolDrift.find((g) => g.targetVol === tv && g.driftPp === dp);
+
+/** 体制状态三读数：末次切换（日期+方向）、当前状态已持续多久 —— 序列尾部数同色段即得 */
+const regimeState = (() => {
+  const n = regimePoints.length;
+  if (!n) return null;
+  let streak = 1;
+  while (streak < n && regimePoints[n - streak]!.regime === regimePoints[n - streak - 1]!.regime) streak++;
+  const cur = regimePoints[n - 1]!;
+  const from = streak < n ? regimePoints[n - streak - 1]! : null;
+  return {
+    since: regimePoints[n - streak]!.date,
+    streak,
+    fromLabel: from ? REGIME_LABEL[from.regime] ?? from.regime : "样本起点",
+    curLabel: REGIME_LABEL[cur.regime] ?? cur.regime,
+  };
+})();
+
+/** Walk-Forward 汇总行：OOS 均值回答"样本外平均能拿到什么"，单年好坏都只是抽样 */
+const wfMean = walkforward
+  ? {
+      is: walkforward.folds.reduce((a, f) => a + f.isSharpe, 0) / walkforward.folds.length,
+      oos: walkforward.folds.reduce((a, f) => a + f.oosSharpe, 0) / walkforward.folds.length,
+      cagr: walkforward.folds.reduce((a, f) => a + f.oosCagr, 0) / walkforward.folds.length,
+      dd: walkforward.folds.reduce((a, f) => a + f.oosMaxDd, 0) / walkforward.folds.length,
+      baseline: walkforward.folds.reduce((a, f) => a + f.baselineOosSharpe, 0) / walkforward.folds.length,
+    }
+  : null;
+
+/**
+ * 置信区间可视化：点估计、95% 区间段、买入持有参照刻度放到同一条轨道上。
+ * 每行用自己的 min(lo,基准)–max(hi,基准) 做定义域；基准点落在区间外 = 差异显著，一眼可读。
+ */
+const ciRows = bootstrap
+  ? ([
+      { k: "夏普", s: bootstrap.strategy.sharpe, bench: bootstrap.benchmark.sharpe.point, fmt: (v: number) => v.toFixed(2) },
+      { k: "最大回撤", s: bootstrap.strategy.maxDrawdown, bench: bootstrap.benchmark.maxDrawdown.point, fmt: (v: number) => fmtPct(v) },
+    ] as const).map((r) => {
+      const lo = Math.min(r.s.lo, r.bench);
+      const hi = Math.max(r.s.hi, r.bench);
+      const pos = (v: number) => ((v - lo) / (hi - lo || 1)) * 100;
+      return { ...r, lo, hi, pos, loPct: pos(r.s.lo), hiPct: pos(r.s.hi), ptPct: pos(r.s.point), benchPct: pos(r.bench) };
+    })
+  : [];
 ---
 <Base active="backtest" crumb="回测实验室" sub={`真实历史 · 消融可拆 · 统计可证伪 · run #${run?.id ?? "—"}`}>
   <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
@@ -230,7 +273,7 @@ const sensCellB = (tv: number, dp: number) => sensitivity?.gridVolDrift.find((g)
           <div class="panel-bd" style="padding-top:0">
             <div class="faint" style="line-height:1.65">
               同一份数据、同一套现金流，只改引擎开关——<b>每个模块值不值得存在由这一张表回答</b>，
-              不由直觉回答。Δ夏普为负的层，要么修，要么关。
+              不由直觉回答。Δ夏普为负的层，要么修，要么关。开关之外的连续参数见下文参数敏感性与 Walk-Forward。
             </div>
           </div>
         </div>
@@ -297,30 +340,28 @@ const sensCellB = (tv: number, dp: number) => sensitivity?.gridVolDrift.find((g)
         </div>
 
         <div class="panel">
-          <div class="panel-hd"><h2>置信区间（块自助法）</h2><span class="hint">500 次重采样 · 期望块长 20 交易日</span></div>
+          <div class="panel-hd"><h2>逐年净值与最深回撤</h2><span class="hint">回撤按历史高点计，与上表同口径</span></div>
           <div class="panel-bd flush">
-            {bootstrap && (
-              <table class="tbl">
-                <thead><tr><th class="l">指标</th><th>策略</th><th>95% CI</th><th>买入持有</th></tr></thead>
-                <tbody>
+            <table class="tbl">
+              <thead><tr><th class="l">年份</th><th>策略年末</th><th>基准年末</th><th>策略最深回撤</th><th>基准最深回撤</th></tr></thead>
+              <tbody>
+                {byYear.map((y) => (
                   <tr>
-                    <td class="l t">夏普</td>
-                    <td class="strong">{bootstrap.strategy.sharpe.point.toFixed(2)}</td>
-                    <td class="dim mono">[{bootstrap.strategy.sharpe.lo.toFixed(2)}, {bootstrap.strategy.sharpe.hi.toFixed(2)}]</td>
-                    <td class="dim">{bootstrap.benchmark.sharpe.point.toFixed(2)}</td>
+                    <td class="l t">{y.year}</td>
+                    <td>{fmtUsd(y.sEnd)}</td>
+                    <td class="dim">{fmtUsd(y.bEnd)}</td>
+                    <td class="down">{fmtPct(y.sDd)}</td>
+                    <td class={y.bDd <= -0.4 ? "down strong" : "down"}>{fmtPct(y.bDd)}</td>
                   </tr>
-                  <tr>
-                    <td class="l t">最大回撤</td>
-                    <td class="strong down">{fmtPct(bootstrap.strategy.maxDrawdown.point)}</td>
-                    <td class="dim mono">[{fmtPct(bootstrap.strategy.maxDrawdown.lo)}, {fmtPct(bootstrap.strategy.maxDrawdown.hi)}]</td>
-                    <td class="dim">{fmtPct(bootstrap.benchmark.maxDrawdown.point)}</td>
-                  </tr>
-                </tbody>
-              </table>
-            )}
+                ))}
+              </tbody>
+            </table>
           </div>
           <div class="panel-bd" style="padding-top:0">
-            {bootstrap && <div class="faint">{bootstrap.note}</div>}
+            <div class="faint" style="line-height:1.65">
+              曲线含每周定投注入，年末净值是账户市值而非收益率。缩表 + 高波动那一年，引擎有 <b class="mono">{riskOff2022}</b> 个交易日停在 risk-off、
+              目标仓位 {fmtRatio(params.allocation?.riskOff)} —— 风险减半不是靠预测顶部，是靠不满仓过冬。
+            </div>
           </div>
         </div>
       </div>
@@ -374,7 +415,7 @@ const sensCellB = (tv: number, dp: number) => sensitivity?.gridVolDrift.find((g)
               <div class="panel-hd"><h2>Walk-Forward</h2><span class="hint">只用过去选参，在"未来"年份验证</span></div>
               <div class="panel-bd flush">
                 <table class="tbl">
-                  <thead><tr><th class="l">OOS 年</th><th class="l">IS 选参</th><th>IS 夏普</th><th>OOS 夏普</th><th>现行参数</th></tr></thead>
+                  <thead><tr><th class="l">OOS 年</th><th class="l">IS 选参</th><th>IS 夏普</th><th>OOS 夏普</th><th>OOS 年化</th><th>OOS 回撤</th><th>现行参数</th></tr></thead>
                   <tbody>
                     {walkforward.folds.map((f) => (
                       <tr>
@@ -382,10 +423,25 @@ const sensCellB = (tv: number, dp: number) => sensitivity?.gridVolDrift.find((g)
                         <td class="l dim mono">{f.chosen.scoreHigh}/{f.chosen.scoreLow}/v{f.chosen.targetVol}</td>
                         <td>{f.isSharpe.toFixed(2)}</td>
                         <td class={f.oosSharpe >= 0 ? "up" : "down"}>{f.oosSharpe.toFixed(2)}</td>
+                        <td class={f.oosCagr >= 0 ? "up" : "down"}>{fmtPct(f.oosCagr)}</td>
+                        <td class="down">{fmtPct(f.oosMaxDd)}</td>
                         <td class="dim">{f.baselineOosSharpe.toFixed(2)}</td>
                       </tr>
                     ))}
                   </tbody>
+                  {wfMean && (
+                    <tfoot>
+                      <tr>
+                        <td class="l t">OOS 均值</td>
+                        <td class="dim">—</td>
+                        <td>{wfMean.is.toFixed(2)}</td>
+                        <td class={wfMean.oos >= 0 ? "up" : "down"}>{wfMean.oos.toFixed(2)}</td>
+                        <td class={wfMean.cagr >= 0 ? "up" : "down"}>{fmtPct(wfMean.cagr)}</td>
+                        <td class="down">{fmtPct(wfMean.dd)}</td>
+                        <td class="dim">{wfMean.baseline.toFixed(2)}</td>
+                      </tr>
+                    </tfoot>
+                  )}
                 </table>
               </div>
               <div class="panel-bd" style="padding-top:0">
@@ -423,11 +479,18 @@ const sensCellB = (tv: number, dp: number) => sensitivity?.gridVolDrift.find((g)
                 <div class="raw"><b>{d.toLocaleString()}</b>天 · {fmtRatio(params.allocation?.[r])}</div>
               </div>
             ))}
+            {regimeState && (
+              <>
+                <div class="sep"></div>
+                <div class="kv"><span class="k">末次切换</span><span class="v">{regimeState.since} · {regimeState.fromLabel} → {regimeState.curLabel}</span></div>
+                <div class="kv"><span class="k">当前状态已持续</span><span class="v">{regimeState.streak.toLocaleString()} 个交易日</span></div>
+                <div class="kv"><span class="k">切换统计</span><span class="v">{switches} 次 · 平均持有 {(regimePoints.length / Math.max(1, switches)).toFixed(0)} 天</span></div>
+              </>
+            )}
             <div class="sep"></div>
             <div class="faint" style="line-height:1.65">
               三态滞回（≥{params.scoreHigh} 进 risk-on · ≤{params.scoreLow} 进 risk-off · 极态回落需越过 {release.toFixed(2)}）
-              让引擎在阈值附近<b>不来回摇摆</b>；{params.gate ? `Sahm 确认门 ≥${params.gate.sahmThreshold}pp 时仓位压回防御档；` : ""}
-              {switches} 次切换平均每次持有 <b class="mono"> {(regimePoints.length / Math.max(1, switches)).toFixed(0)}</b> 天。
+              让引擎在阈值附近<b>不来回摇摆</b>。{params.gate && <span>Sahm 确认门 ≥{params.gate.sahmThreshold}pp 时仓位压回防御档。</span>}
             </div>
           </div>
         </div>
@@ -436,7 +499,7 @@ const sensCellB = (tv: number, dp: number) => sensitivity?.gridVolDrift.find((g)
       <div class="grid g-21" style="margin-top:12px">
         <div class="panel">
           <div class="panel-hd"><h2>五信号百分位时间线</h2><span class="hint">0.6 / 0.4 是极值参考线，非切换阈值（阈值看综合分）</span></div>
-          <div class="panel-bd"><SignalChart client:load points={regimePoints.map((p) => ({ date: p.date, signals: p.signals }))} /></div>
+          <div class="panel-bd grow"><SignalChart client:load fill points={regimePoints.map((p) => ({ date: p.date, signals: p.signals }))} /></div>
         </div>
         <div class="panel">
           <div class="panel-hd"><h2>策略参数</h2><span class="hint">config/strategy.json · 单一事实源</span></div>
@@ -464,28 +527,54 @@ const sensCellB = (tv: number, dp: number) => sensitivity?.gridVolDrift.find((g)
 
       <div class="grid g-2" style="margin-top:12px">
         <div class="panel">
-          <div class="panel-hd"><h2>逐年净值与最深回撤</h2><span class="hint">回撤按历史高点计，与上表同口径</span></div>
+          <div class="panel-hd"><h2>置信区间（块自助法）</h2><span class="hint">500 次重采样 · 期望块长 20 交易日</span></div>
           <div class="panel-bd flush">
-            <table class="tbl">
-              <thead><tr><th class="l">年份</th><th>策略年末</th><th>基准年末</th><th>策略最深回撤</th><th>基准最深回撤</th></tr></thead>
-              <tbody>
-                {byYear.map((y) => (
+            {bootstrap && (
+              <table class="tbl">
+                <thead><tr><th class="l">指标</th><th>策略</th><th>95% CI</th><th>买入持有</th></tr></thead>
+                <tbody>
                   <tr>
-                    <td class="l t">{y.year}</td>
-                    <td>{fmtUsd(y.sEnd)}</td>
-                    <td class="dim">{fmtUsd(y.bEnd)}</td>
-                    <td class="down">{fmtPct(y.sDd)}</td>
-                    <td class={y.bDd <= -0.4 ? "down strong" : "down"}>{fmtPct(y.bDd)}</td>
+                    <td class="l t">夏普</td>
+                    <td class="strong">{bootstrap.strategy.sharpe.point.toFixed(2)}</td>
+                    <td class="dim mono">[{bootstrap.strategy.sharpe.lo.toFixed(2)}, {bootstrap.strategy.sharpe.hi.toFixed(2)}]</td>
+                    <td class="dim">{bootstrap.benchmark.sharpe.point.toFixed(2)}</td>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                  <tr>
+                    <td class="l t">最大回撤</td>
+                    <td class="strong down">{fmtPct(bootstrap.strategy.maxDrawdown.point)}</td>
+                    <td class="dim mono">[{fmtPct(bootstrap.strategy.maxDrawdown.lo)}, {fmtPct(bootstrap.strategy.maxDrawdown.hi)}]</td>
+                    <td class="dim">{fmtPct(bootstrap.benchmark.maxDrawdown.point)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            )}
           </div>
           <div class="panel-bd" style="padding-top:0">
-            <div class="faint" style="line-height:1.65">
-              曲线含每周定投注入，年末净值是账户市值而非收益率。缩表 + 高波动那一年，引擎有 <b class="mono">{riskOff2022}</b> 个交易日停在 risk-off、
-              目标仓位 {fmtRatio(params.allocation?.riskOff)} —— 风险减半不是靠预测顶部，是靠不满仓过冬。
-            </div>
+            {bootstrap && (
+              <>
+                <div class="ci">
+                  {ciRows.map((r) => (
+                    <>
+                      <div class="k">{r.k}</div>
+                      <div class="track">
+                        <div class="rail"></div>
+                        <div class="seg" style={`left:${r.loPct}%;width:${r.hiPct - r.loPct}%`}></div>
+                        <i class="bench" style={`left:${r.benchPct}%`} title={`买入持有 ${r.fmt(r.bench)}`}></i>
+                        <i class="pt" style={`left:${r.ptPct}%`} title={`策略 ${r.fmt(r.s.point)}`}></i>
+                        <span class="cap l">{r.fmt(r.lo)}</span>
+                        <span class="cap r">{r.fmt(r.hi)}</span>
+                      </div>
+                    </>
+                  ))}
+                </div>
+                <div class="faint" style="margin-top:10px;line-height:1.65">
+                  黄段 = 策略 95% 区间，黄条 = 点估计，白刻度 = 买入持有。刻度落在黄段之外，"跑赢"才不是抽样运气。
+                </div>
+              </>
+            )}
+          </div>
+          <div class="panel-bd" style="margin-top:auto;padding-top:0">
+            {bootstrap && <div class="faint">{bootstrap.note}</div>}
           </div>
         </div>
 
@@ -496,6 +585,8 @@ const sensCellB = (tv: number, dp: number) => sensitivity?.gridVolDrift.find((g)
               <div>· <b style="color:var(--text-3)">能</b>：同一规则在同一历史上的相对表现——三腿对照、逐层消融、参数邻域稳定性都是**内比较**，不依赖预测。</div>
               <div>· <b style="color:var(--text-3)">能</b>：历史条件化统计（类比窗口、蒙特卡洛分布）——前提是"未来长得像过去"。</div>
               <div>· <b style="color:var(--text-3)">不能</b>：预测任何具体点位、时间或收益。页面上没有一项输出是预测。</div>
+              <div>· <b style="color:var(--text-3)">数据</b>：价格与财报来自同步脚本的本地 CSV，宏观读数来自 FRED——缺数显式标警，不插值造数。</div>
+              <div>· <b style="color:var(--text-3)">复核</b>：回测固定种子，<span class="mono">npm run backtest</span> 重跑出的每个数字都应与本页一致；对不上是 bug，不是玄学。</div>
               <div>· 成本模型是估计：半价差按大盘股盘口量级取 {params.cost?.halfSpreadBps}bps，冲击按 √市值模型——真实滑点请用"真实账本"实测校准（trades 页）。</div>
               <div>· 样本只有一轮 2020→今的牛熊：所有结论的可信度以自助法区间与 walk-forward 为界，不以曲线美观为界。</div>
             </div>

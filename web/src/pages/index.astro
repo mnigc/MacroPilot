@@ -264,7 +264,7 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
         <h2>宏观体制</h2><span class="hint">综合分 = 四信号百分位加权 · 三态滞回</span>
         <div class="right"><span class="faint">截至 {latest?.date ?? "—"}</span></div>
       </div>
-      <div class="panel-bd">
+      <div class="panel-bd grow">
         <div class="gauge">
         <div class="gauge-score">
           <span class="big">{score.toFixed(3)}</span>
@@ -293,6 +293,7 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
           scoreLow={e.regime.scoreLow}
           scoreRelease={e.regime.scoreRelease}
           short
+          fill
         />
       </div>
     </div>
@@ -427,8 +428,8 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
         <h2>当前持仓</h2><span class="hint">paper · 等权目标 {fmtPct(targetEach, 1)}/只</span>
         <div class="right"><span class="faint">现金 {fmtUsd(cash)}</span></div>
       </div>
-      <div class="panel-bd flush">
-        <table class="tbl">
+      <div class="panel-bd flush grow">
+        <table class="tbl fill">
           <thead>
             <tr><th class="l">标的</th><th>持仓</th><th>收盘价</th><th>市值</th><th>权重</th><th>目标</th><th>偏离</th></tr>
           </thead>
@@ -459,6 +460,12 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
             </tr>
           </tfoot>
         </table>
+      </div>
+      <div class="panel-bd" style="padding-top:0">
+        <div class="faint" style="line-height:1.65">
+          偏离 = 权重 − 目标，|偏离| &gt; ±{e.drift.thresholdPp}pp 触发拉回 · 财报窗口内目标 ×{e.earnings.scaleFactor}（当前 {[...earnWindow.keys()].filter(inWindow).length} 只在窗）·
+          现金不计息，随下一轮定投（{nextFriday}）按目标权重部署。
+        </div>
       </div>
     </div>
 

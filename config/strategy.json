@@ -2,7 +2,15 @@
   "$comment": "策略参数：六个策略模块（定投/体制/波动率目标/估值锚/漂移/财报）共享一个纸面执行器，输出合成一张目标权重表。所有可调参数集中在此。",
   "basket": {
     "$comment": "目标篮子：当前为等权 Mag7。改这份 ticker 列表即可换标的组合（数据由 scripts/sync-prices.py 从 yfinance 同步）",
-    "tickers": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA"]
+    "tickers": [
+      "NVDA",
+      "AAPL",
+      "MSFT",
+      "AMZN",
+      "GOOGL",
+      "META",
+      "TSLA"
+    ]
   },
   "engines": {
     "dca": {
@@ -16,32 +24,56 @@
       "scoreHigh": 0.6,
       "scoreLow": 0.3,
       "scoreRelease": 0.45,
-      "allocation": { "riskOn": 1.0, "neutral": 0.6, "riskOff": 0.25 },
+      "allocation": {
+        "riskOn": 1.0,
+        "neutral": 0.75,
+        "riskOff": 0.25
+      },
       "gate": {
         "$comment": "Sahm 确认门：失业率 3 个月均值 − 12 个月低点 ≥ 0.5pp（经典衰退阈值）时，权益仓位上限压回 risk-off 档。它不参与加权投票——确认信号被加权会稀释",
         "sahmThreshold": 0.5
       },
       "signals": {
-        "liquidity": { "$comment": "美联储资产负债表 13 周变化", "fredSeries": "WALCL", "weight": 0.24 },
-        "volatility": { "$comment": "VIX 水平 70% + 1 月趋势 30%", "fredSeries": "VIXCLS", "weight": 0.24 },
-        "rates": { "$comment": "10Y 国债收益率 13 周变化（下行加分）", "fredSeries": "DGS10", "weight": 0.16 },
-        "trend": { "$comment": "标普 500 相对 200 日均线", "fredSeries": "SP500", "weight": 0.16 },
-        "credit": { "$comment": "高收益信用利差：水平 70% + 13 周变化 30%（收紧减分）", "fredSeries": "BAMLH0A0HYM2", "weight": 0.2 }
+        "liquidity": {
+          "$comment": "美联储资产负债表 13 周变化",
+          "fredSeries": "WALCL",
+          "weight": 0.24
+        },
+        "volatility": {
+          "$comment": "VIX 水平 70% + 1 月趋势 30%",
+          "fredSeries": "VIXCLS",
+          "weight": 0.24
+        },
+        "rates": {
+          "$comment": "10Y 国债收益率 13 周变化（下行加分）",
+          "fredSeries": "DGS10",
+          "weight": 0.16
+        },
+        "trend": {
+          "$comment": "标普 500 相对 200 日均线",
+          "fredSeries": "SP500",
+          "weight": 0.16
+        },
+        "credit": {
+          "$comment": "高收益信用利差：水平 70% + 13 周变化 30%（收紧减分）",
+          "fredSeries": "BAMLH0A0HYM2",
+          "weight": 0.2
+        }
       }
     },
     "volTarget": {
       "$comment": "波动率目标叠加：21 日已实现波动高于目标就按比例减仓（不杠杆，ceiling≤1）。它改的是体制档位的乘数，不投票不改状态机",
       "enabled": true,
-      "targetVol": 0.15,
+      "targetVol": 0.18,
       "lookbackDays": 21,
-      "floor": 0.5,
+      "floor": 0.6,
       "ceiling": 1.0,
       "triggerPp": 10
     },
     "valuation": {
       "$comment": "估值锚叠加：CAPE 滚动百分位 → ±maxTilt 线性偏移（贵时少买，便宜时多买）。CAPE 月度数据由 scripts/sync-valuation.py 抓 multpl.com 存 data/valuation/cape.csv；文件缺失时本引擎按关闭处理并在站点标注",
       "enabled": true,
-      "maxTilt": 0.15,
+      "maxTilt": 0.1,
       "lookbackYears": 20,
       "triggerPp": 5
     },
