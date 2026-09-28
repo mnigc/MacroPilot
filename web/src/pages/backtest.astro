@@ -445,7 +445,10 @@ const ciRows = bootstrap
                 </table>
               </div>
               <div class="panel-bd" style="padding-top:0">
-                <div class="faint">{walkforward.note}</div>
+                <div class="faint" style="line-height:1.65">
+                  {walkforward.note}
+                  "现行参数"列是现行全局参数若冻结在当年使用的 OOS 成绩——对照每年重新选参还有多少提升余地。
+                </div>
               </div>
             </div>
           )}
@@ -580,8 +583,8 @@ const ciRows = bootstrap
 
         <div class="panel">
           <div class="panel-hd"><h2>方法论声明</h2><span class="hint">这份回测能回答什么、不能回答什么</span></div>
-          <div class="panel-bd">
-            <div class="faint" style="line-height:1.9">
+          <div class="panel-bd grow" style="justify-content:center">
+            <div class="faint" style="line-height:2">
               <div>· <b style="color:var(--text-3)">能</b>：同一规则在同一历史上的相对表现——三腿对照、逐层消融、参数邻域稳定性都是**内比较**，不依赖预测。</div>
               <div>· <b style="color:var(--text-3)">能</b>：历史条件化统计（类比窗口、蒙特卡洛分布）——前提是"未来长得像过去"。</div>
               <div>· <b style="color:var(--text-3)">不能</b>：预测任何具体点位、时间或收益。页面上没有一项输出是预测。</div>
