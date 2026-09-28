@@ -60,14 +60,14 @@ const compare = run
     )
   : [];
 
-/** 全年收益 = 各月连乘；泛型标注不能出现在模板表达式里（会被当成 HTML 标签解析） */
+/** 全年收益 = 各月 (1+r) 连乘 − 1；泛型标注不能出现在模板表达式里（会被当成 HTML 标签解析） */
 const compound = (months: (number | null)[]): number | null => {
   let acc: number | null = null;
   for (const m of months) {
     if (m === null) continue;
-    acc = acc === null ? m : acc * (1 + m);
+    acc = acc === null ? 1 + m : acc * (1 + m);
   }
-  return acc;
+  return acc === null ? null : acc - 1;
 };
 
 /** 月度收益单元格底色：|收益| 越大颜色越深，正绿负红 */
@@ -246,7 +246,7 @@ const sensCellB = (tv: number, dp: number) => sensitivity?.gridVolDrift.find((g)
 
       <div class="grid g-2" style="margin-top:12px">
         <div class="panel">
-          <div class="panel-hd"><h2>月度收益 · 策略</h2><span class="hint">月末日对月末日 · 颜色深浅按 |收益|</span></div>
+          <div class="panel-hd"><h2>月度收益 · 策略</h2><span class="hint">月末日对月末日（含每周定投入金，读数略被摊薄）· 颜色深浅按 |收益|</span></div>
           <div class="panel-bd flush" style="overflow-x:auto">
             {monthly && (
               <table class="tbl">
