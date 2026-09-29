@@ -15,6 +15,7 @@
     "agent": "tsx src/run-once.ts",
     "agent:dry": "tsx src/run-once.ts --dry-run",
     "import-real": "tsx scripts/import-real.ts",
+    "account": "tsx scripts/account.ts",
     "import-csv": "tsx scripts/import-csv.ts",
     "web:build": "npm --prefix web run build",
     "preview": "npm --prefix web run preview"

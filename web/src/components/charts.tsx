@@ -283,7 +283,11 @@ export function SignalChart(props: { points: { date: string; signals: Record<str
         ...SIGNAL_META.map((meta) => ({
           name: meta.label,
           type: "line" as const,
-          data: props.points.map((p) => [p.date, p.signals[meta.key] ?? 0]),
+          data: props.points.map((p) => {
+            // 老 run 缺某路信号（如 credit）时画断点而不是贴地 0 线——0 在语义上是"极度收紧"
+            const v = p.signals[meta.key];
+            return [p.date, v === undefined || v === null ? (null as unknown as number) : v];
+          }),
           showSymbol: false,
           smooth: 0.12,
           lineStyle: { color: meta.color, width: 1.3 },
@@ -643,6 +647,53 @@ export function RollingChart(props: {
     },
     [props.strategy, props.benchmark],
     "chart short",
+  );
+  return el;
+}
+
+/** 账本净值对比（实盘部署页）：实盘 / 影子 / 纸面三条线，没数据的账本由调用方过滤掉不传 */
+export function LedgerChart(props: {
+  series: { name: string; points: ChartPoint[]; color?: string; dashed?: boolean }[];
+}) {
+  const fallback = [C.yellow, C.blue, C.text2];
+  const el = useChart(
+    {
+      backgroundColor: "transparent",
+      animationDuration: 500,
+      animationEasing: "cubicOut",
+      tooltip: {
+        trigger: "axis",
+        ...TOOLTIP,
+        valueFormatter: (v) => `$${Number(v).toLocaleString("en-US", { maximumFractionDigits: 0 })}`,
+      },
+      legend: { ...LEGEND, data: props.series.map((s) => s.name) },
+      grid: { left: 58, right: 20, top: 32, bottom: 60 },
+      xAxis: AXIS_TIME,
+      yAxis: {
+        type: "value",
+        scale: true,
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: { color: C.text, fontSize: 11, formatter: (v: number) => `$${(v / 1000).toFixed(0)}k` },
+        splitLine: { lineStyle: { color: C.split } },
+      },
+      dataZoom: ZOOM_STYLE,
+      series: props.series.map((s, i) => ({
+        name: s.name,
+        type: "line" as const,
+        data: s.points.map((p) => [p.date, p.value]),
+        showSymbol: false,
+        lineStyle: {
+          color: s.color ?? fallback[i],
+          width: i === 0 ? 1.8 : 1.2,
+          type: s.dashed ? ("dashed" as const) : ("solid" as const),
+        },
+        itemStyle: { color: s.color ?? fallback[i] },
+        ...(i === 0 ? { areaStyle: { color: areaGradient("rgba(252,213,53,A)", 0.12) } } : {}),
+      })),
+    },
+    [props.series],
+    "chart",
   );
   return el;
 }

@@ -12,18 +12,54 @@ import { createHash } from "node:crypto";
 import { runOnce, type ExecutorConfig } from "./exec/executor.js";
 import { earningsCalendarStatus } from "./db/index.js";
 import { regimeConfigOf, loadStrategyFile, volTargetConfigOf, valuationConfigOf } from "./backtest/context.js";
+import { loadAccountFile } from "./account/config.js";
 import { splitDrivers } from "./strategy/drivers.js";
 
 const raw = loadStrategyFile();
 const dryRun = process.argv.includes("--dry-run");
 
 /**
- * 账本分区。默认 paper（公开账本）；config 里临时改成别的值即可空跑执行器。
+ * 账本分区。默认 paper（公开账本）；config 的 execution.mode 或命令行 --mode 可临时指向
+ * 别的分区空跑执行器（如真实本金规模的影子账本 live-plan）。
  * CI 里必须为 paper——否则一次误提交的试跑分区会让公开仪表盘静默停更，所以直接失败而不是警告。
  */
-const mode = raw.execution.mode ?? "paper";
+const modeFlagIdx = process.argv.indexOf("--mode");
+const mode = modeFlagIdx > -1
+  ? process.argv[modeFlagIdx + 1] ?? ""
+  : raw.execution.mode ?? "paper";
+if (modeFlagIdx > -1 && !mode) {
+  throw new Error("--mode 需要一个分区名，例如: npm run agent -- --mode live-plan");
+}
 if (process.env.CI && mode !== "paper") {
   throw new Error(`CI 环境下 execution.mode 必须为 paper，当前为 "${mode}"——请检查 config/strategy.json 是否误提交了试跑分区`);
+}
+
+/**
+ * 注入源：账本分区与 account.json 的 deployment.ledgerMode 一致时，切换为 deposits 模式——
+ * 注入额来自台账未部署的新入金（npm run account -- record），批次到账后下一轮自动部署；
+ * paper 与其他试跑分区保持每周五定投。
+ */
+let injectionMode: "weekly" | "deposits" = "weekly";
+let depositFxFallback: number | undefined;
+try {
+  const acct = loadAccountFile();
+  if (mode === acct.deployment.ledgerMode) {
+    injectionMode = "deposits";
+    depositFxFallback = acct.capital.fxAssumptionCnyPerUsd;
+  }
+} catch {
+  /* account.json 不在时按 weekly 定投 */
+}
+
+/** 深度剔除 "$" 前缀键：$comment 是给人看的注释，进签名会让改注释也触发 retarget */
+function stripMetaKeys<T>(v: T): T {
+  if (Array.isArray(v)) return v.map(stripMetaKeys) as unknown as T;
+  if (v && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v)) if (!k.startsWith("$")) out[k] = stripMetaKeys(val);
+    return out as T;
+  }
+  return v;
 }
 
 const cfg: ExecutorConfig = {
@@ -32,6 +68,8 @@ const cfg: ExecutorConfig = {
   dryRun,
   startCash: raw.execution.startCashUsdt ?? 10_000,
   dcaUsdt: raw.engines.dca.amountUsdt,
+  injectionMode,
+  depositFxFallback,
   driftThresholdPp: raw.engines.drift.thresholdPp,
   minTradeUsdt: raw.execution.minTradeUsdt,
   slippagePercent: raw.execution.slippagePercent,
@@ -46,10 +84,11 @@ const cfg: ExecutorConfig = {
   valuation: valuationConfigOf(raw),
   cost: raw.execution.cost ?? { halfSpreadBps: 3, impactCoef: 0.35, earningsMult: 1.5 },
   cashInterest: raw.execution.cashInterest ?? true,
-  // 配置签名：影响目标表的全部参数——变更即触发 retarget 对齐，不等漂移阈值
+  // 配置签名：影响目标表的全部参数——变更即触发 retarget 对齐，不等漂移阈值。
+  // $comment 注释键剔除后再哈希，否则纯文案修改也会造成一次无谓的强制调仓
   configSig: createHash("sha1")
     .update(
-      JSON.stringify({
+      JSON.stringify(stripMetaKeys({
         allocation: raw.engines.regime.allocation,
         gate: raw.engines.regime.gate ?? null,
         volTarget: raw.engines.volTarget ?? null,
@@ -57,7 +96,7 @@ const cfg: ExecutorConfig = {
         drift: raw.engines.drift,
         earnings: raw.engines.earnings,
         tickers: raw.basket.tickers,
-      }),
+      })),
     )
     .digest("hex")
     .slice(0, 12),
@@ -84,6 +123,12 @@ console.log(
     ` × 波动率 ${composition.volMult !== undefined ? composition.volMult.toFixed(2) : "—"} × (1 + 估值 ${composition.tilt !== undefined ? (composition.tilt * 100).toFixed(1) + "%" : "—"})`,
 );
 if (summary.cashInterestUsd > 0) console.log(`现金计息: +$${summary.cashInterestUsd.toFixed(2)}（DGS3MO，按距上一轮天数）`);
+if (summary.injectionUsd > 0) {
+  console.log(
+    `本轮注入: $${summary.injectionUsd.toFixed(2)}` +
+      (cfg.injectionMode === "deposits" ? "（部署台账新入金）" : "（周五定投）"),
+  );
+}
 if (cfg.earnings.enabled) {
   const status = await earningsCalendarStatus(cfg.tickers);
   console.log(`财报日历: ${status.rows} 行（未来 ${status.upcoming} 场）`);

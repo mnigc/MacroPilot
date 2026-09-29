@@ -1,0 +1,26 @@
+{
+  "$comment": "实盘账户层（阶段0）：资金规划、换汇额度、分批建仓计划。策略层（strategy.json）只回答'按什么权重买'，这里回答'有多少钱、什么时候到、还能换多少汇'。换汇额度的已用进度不手工维护——由 npm run account 记录的入金流水按年自动汇总。",
+  "account": {
+    "$comment": "status: opening 开户中 / funded 已入金 / live 跟单中（手工维护，供站点展示）",
+    "broker": "IBKR（盈透）",
+    "status": "opening"
+  },
+  "capital": {
+    "$comment": "annualQuotaUsd: 个人购汇便利化额度（美元/年）。额度内换不完的部分留作人民币缓冲，次年额度刷新后再入金——批次计划因此刻意不把 7 万美元全排进去",
+    "totalPlannedCny": 500000,
+    "fxAssumptionCnyPerUsd": 7.1,
+    "annualQuotaUsd": 50000
+  },
+  "deployment": {
+    "$comment": "ledgerMode: 用真实本金规模空跑的影子账本分区，注入源=台账新入金——批次到账后 npm run account -- record 记一笔 deposit，下一次 npm run agent -- --mode live-plan 自动把待部署入金按目标权重买进账本（不是每周 $50 定投，那是 paper 的现金流模拟）。首批真金下单前先这样空跑 4-8 周观察。",
+    "ledgerMode": "live-plan",
+    "$comment2": "批次 = 入金节奏（额度约束），不是仓位节奏——每批到账后按执行器当期目标权重表买入，实际仓位由体制/波动率/估值三层合成决定",
+    "batches": [
+      { "label": "第1批", "targetDate": "2026-12-04", "amountUsd": 10000 },
+      { "label": "第2批", "targetDate": "2027-01-08", "amountUsd": 10000 },
+      { "label": "第3批", "targetDate": "2027-02-05", "amountUsd": 10000 },
+      { "label": "第4批", "targetDate": "2027-03-05", "amountUsd": 10000 },
+      { "label": "第5批", "targetDate": "2027-04-02", "amountUsd": 10000 }
+    ]
+  }
+}

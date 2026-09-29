@@ -1,0 +1,297 @@
+---
+import Base from "../layouts/Base.astro";
+import { LedgerChart } from "../components/charts";
+import { getAccountLayer, getPendingDeposits, ledgerView, KIND_LABEL, STATUS_LABEL } from "../lib/account";
+import { getExecutorPreview, getExecutorRun, getRealVsPaper } from "../lib/db";
+import { fmtUsd, fmtPct } from "../lib/engineState";
+
+/** 账户层（config + 台账 + 批次）与三个账本视图一次装配 */
+const layer = await getAccountLayer();
+const pending = await getPendingDeposits(layer.cfg.capital.fxAssumptionCnyPerUsd);
+const today = new Date().toISOString().slice(0, 10);
+const year = Number(today.slice(0, 4));
+const quotaUsed = layer.depositsUsdByYear[year] ?? 0;
+const deployedUsd = Object.values(layer.depositsUsdByYear).reduce((a, b) => a + b, 0);
+const shadowMode = layer.cfg.deployment.ledgerMode;
+
+const [shadow, real, paper] = await Promise.all([ledgerView(shadowMode), ledgerView("real"), ledgerView("paper")]);
+const series = [
+  { name: "实盘", points: real?.curve ?? [] },
+  { name: `影子(${shadowMode})`, points: shadow?.curve ?? [] },
+  { name: "纸面", points: paper?.curve ?? [], dashed: true },
+].filter((s) => s.points.length > 0);
+
+// 操作清单读影子账本的执行预告；影子还没跑过时退回 paper 口径并明示
+const [previewShadow, previewPaper] = await Promise.all([getExecutorPreview(shadowMode), getExecutorPreview("paper")]);
+const preview = previewShadow ?? previewPaper;
+const previewFallback = !previewShadow && !!previewPaper;
+const [execShadow, execPaper] = await Promise.all([getExecutorRun(shadowMode), getExecutorRun("paper")]);
+const executor = execShadow ?? execPaper;
+const execAgeH = executor ? (Date.now() - Date.parse(executor.at)) / 3_600_000 : null;
+const execChip = execAgeH === null ? "" : execAgeH <= 30 ? "ok" : execAgeH <= 54 ? "warn" : "bad";
+
+/** 实测滑点汇总：按名义额加权的平均偏差与最大单笔偏差（bps） */
+const rv = await getRealVsPaper();
+const slip = rv.length
+  ? (() => {
+      const wNotional = rv.reduce((a, r) => a + Math.abs(r.units_delta) * r.paperClose, 0);
+      const slipBps = wNotional > 0
+        ? (rv.reduce((a, r) => a + Math.abs(r.realPx - r.paperClose) * Math.abs(r.units_delta), 0) / wNotional) * 10_000
+        : 0;
+      return { n: rv.length, bps: slipBps, worst: Math.max(...rv.map((r) => Math.abs(r.realPx / r.paperClose - 1)) * 10_000) };
+    })()
+  : null;
+
+const statusLabel = STATUS_LABEL[layer.cfg.account.status] ?? layer.cfg.account.status;
+const quotaPct = layer.cfg.capital.annualQuotaUsd > 0 ? quotaUsed / layer.cfg.capital.annualQuotaUsd : 0;
+const missingAll = [...new Set([...(shadow?.missingPx ?? []), ...(real?.missingPx ?? [])])];
+const driftHot = preview?.drifts.filter((d) => Math.abs(d.driftPp) > d.thresholdPp) ?? [];
+const driftWarm = preview?.drifts
+  .filter((d) => Math.abs(d.driftPp) > d.thresholdPp * 0.6 && Math.abs(d.driftPp) <= d.thresholdPp)
+  .slice(0, 4) ?? [];
+---
+
+<Base active="deploy" crumb="实盘部署" sub="账户层 · 分批建仓 · 执行对账 —— 系统出单，人执行，系统对账">
+  <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
+    <span class="chip">{layer.cfg.account.broker}</span>
+    <span class="chip">{statusLabel}</span>
+  </div>
+
+  <div class="tiles">
+    <div class="tile">
+      <div class="tile-k">已入金</div>
+      <div class="tile-v">{fmtUsd(deployedUsd)}</div>
+      <div class="tile-s">{layer.depositCount} 笔 · 计划合计 {fmtUsd(layer.plannedUsd)} · 缓冲 {Math.round(layer.bufferCny).toLocaleString()} CNY</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">购汇额度 {year}</div>
+      <div class="tile-v sm">${quotaUsed.toLocaleString("en-US", { maximumFractionDigits: 2 })} <span class="faint">/ ${layer.cfg.capital.annualQuotaUsd.toLocaleString()}</span></div>
+      <div class="bar lg" style="margin-top:8px"><i style={`width:${Math.min(100, quotaPct * 100)}%`}></i></div>
+      <div class="tile-s">剩余 ${Math.max(0, layer.cfg.capital.annualQuotaUsd - quotaUsed).toLocaleString()} · 由入金流水按年汇总</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">建仓批次</div>
+      <div class="tile-v">{layer.doneBatches}<span class="faint">/{layer.batches.length}</span></div>
+      <div class="bar lg" style="margin-top:8px"><i style={`width:${(layer.doneBatches / (layer.batches.length || 1)) * 100}%`}></i></div>
+      <div class="tile-s">{layer.nextBatch ? `下批 ${layer.nextBatch.targetDate} · $${layer.nextBatch.amountUsd.toLocaleString()}` : "计划批次已全部到期"}</div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">影子账本 · {shadowMode}</div>
+      <div class="tile-v sm">{shadow ? fmtUsd(shadow.equity) : "未播种"}</div>
+      <div class="tile-s">
+        {shadow ? `现金 ${fmtUsd(shadow.cash)} · 持仓 ${shadow.positions.length} 只 · ${shadow.fills} 笔成交` : `入金到账后 npm run account -- seed`}
+      </div>
+    </div>
+    <div class="tile">
+      <div class="tile-k">实盘账本</div>
+      <div class="tile-v sm">{real ? fmtUsd(real.equity) : "未导入"}</div>
+      <div class="tile-s">{real ? `${real.fills} 笔成交 · ${real.firstDate ?? ""} 起` : "券商成交导出后 npm run import-real"}</div>
+    </div>
+  </div>
+
+  {missingAll.length > 0 && (
+    <div class="note bad" style="margin-top:12px">
+      <span class="ic">⚠</span>
+      <div><b>{missingAll.join("、")} 无最新行情</b>，相关持仓按 0 计——先跑价格同步再读净值。</div>
+    </div>
+  )}
+
+  <div class="grid g-32" style="margin-top:12px">
+    <div class="panel">
+      <div class="panel-hd">
+        <h2>分批建仓计划</h2><span class="hint">批次 = 入金节奏；实际仓位由体制/波动率/估值三层合成决定</span>
+      </div>
+      <div class="panel-bd flush grow">
+        <table class="tbl fill">
+          <thead><tr><th class="l">批次</th><th>目标日期</th><th>金额</th><th>累计</th><th>状态</th></tr></thead>
+          <tbody>
+            {layer.batches.map((b) => (
+              <tr>
+                <td class="l t"><b>{b.label}</b></td>
+                <td>{b.targetDate}</td>
+                <td class="strong">${b.amountUsd.toLocaleString()}</td>
+                <td class="dim">${b.cumulative.toLocaleString()}</td>
+                <td class={b.due ? "yel" : "dim"}>{b.due ? "已到期" : "待执行"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <h2>资金流水</h2><span class="hint">account_events 台账 · 只增不删，错账用反向金额对冲</span>
+        <div class="right"><span class="faint">{layer.events.length} 条</span></div>
+      </div>
+      <div class="panel-bd flush grow">
+        <table class="tbl fill">
+          <thead><tr><th class="l">日期</th><th class="l">类型</th><th>金额</th><th>汇率</th><th class="l">备注</th></tr></thead>
+          <tbody>
+            {layer.events.slice(0, 8).map((e) => (
+              <tr>
+                <td class="l dim">{e.occurredAt}</td>
+                <td class="l">{KIND_LABEL[e.kind] ?? e.kind}</td>
+                <td class:list={["strong", e.amount >= 0 ? "up" : "down"]}>{e.amount > 0 ? "+" : ""}{e.amount.toLocaleString()} {e.currency}</td>
+                <td class="dim">{e.fxRate ?? "—"}</td>
+                <td class="l dim">{e.note ?? "—"}</td>
+              </tr>
+            ))}
+            {layer.events.length === 0 && <tr><td colspan="5" class="empty">台账为空 —— 入金/换汇后 <code>npm run account -- record &lt;kind&gt; --date ... --amount ...</code></td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd">
+      <h2>净值对比</h2><span class="hint">实盘 vs 影子 vs 纸面 —— 手动执行跟丢了多少，一眼可查</span>
+      {real && <div class="right"><span class="faint">{real.firstDate} 起 · {real.fills} 笔</span></div>}
+    </div>
+    <div class="panel-bd">
+      {series.length > 0 ? (
+        <>
+          <LedgerChart client:load series={series} />
+          <div class="faint" style="margin-top:6px;line-height:1.65">
+            曲线按交易日重放成交现金流（含逐笔成本，现金锚定当前值；现金计息未重放，历史段闲置现金收益略有低估）。
+            实盘曲线来自 import-real 导入的券商成交，影子与纸面来自各自执行分区。
+          </div>
+        </>
+      ) : (
+        <div class="empty">
+          三个账本都还没有成交 —— 首批入金到账后 <code>npm run account -- seed --cash &lt;金额&gt;</code>，影子账本跑出第一笔后这里会出现三条净值线。
+        </div>
+      )}
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd">
+      <h2>本周操作清单</h2><span class="hint">照单执行 → 券商下单 → 导入成交 → 回来看偏差</span>
+      <div class="right">
+        <span class:list={["chip", execChip]} title="runtime_state.updated_at：每跑完一轮就写一次">
+          {shadowMode} 上一轮 {executor ? `${executor.at.slice(5, 16).replace("T", " ")}Z` : "未运行"}
+        </span>
+      </div>
+    </div>
+    <div class="panel-bd">
+      {preview ? (
+        <>
+          {previewFallback && (
+            <div class="note" style="margin-bottom:10px">
+              <span class="ic">ℹ</span>
+              <div>影子账本 <b>{shadowMode}</b> 还没有执行预告（<code>npm run agent -- --mode {shadowMode}</code>）——以下为 paper 口径，引擎参数相同。注意 paper 的「每周 $50 定投」是纸面账本的现金流模拟，不适用于实盘：实盘的注入 = 台账新入金（上方批次表到账后 <code>record</code>，下一次运行自动部署）。</div>
+            </div>
+          )}
+          <div class="tiles" style="grid-template-columns:repeat(3,1fr)">
+            <div class="tile">
+              <div class="tile-k">目标仓位合成</div>
+              <div class="tile-v sm">{((preview.composition.final ?? 0) * 100).toFixed(0)}%</div>
+              <div class="tile-s">体制 {(preview.composition.regimeTarget * 100).toFixed(0)}% × 波动率 {preview.composition.volMult !== null ? `×${preview.composition.volMult.toFixed(2)}` : "×—"}{preview.composition.tilt !== null ? ` × (1${preview.composition.tilt >= 0 ? "+" : ""}${(preview.composition.tilt * 100).toFixed(1)}%)` : ""}</div>
+            </div>
+            <div class="tile">
+              {previewShadow ? (
+                <>
+                  <div class="tile-k">待部署入金</div>
+                  <div class="tile-v sm">${pending.usd.toLocaleString("en-US", { maximumFractionDigits: 2 })}</div>
+                  <div class="tile-s">
+                    {pending.rows.length
+                      ? `${pending.rows.length} 笔新入金 · 下一次 npm run agent -- --mode ${shadowMode} 自动按目标权重部署`
+                      : `台账无新入金 · 下批 ${layer.nextBatch ? `${layer.nextBatch.targetDate} $${layer.nextBatch.amountUsd.toLocaleString()}` : "—"}`}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div class="tile-k">下轮定投 {preview.nextFriday?.date ?? "—"}</div>
+                  <div class="tile-v sm">${preview.nextFriday?.injectionUsdt ?? 0}</div>
+                  <div class="tile-s">{preview.nextFriday?.planned.map((p) => `${p.ticker} $${p.usdt}`).join(" · ") || "—"}</div>
+                </>
+              )}
+            </div>
+            <div class="tile">
+              <div class="tile-k">未来 14 天财报</div>
+              <div class="tile-v sm">{preview.earningsNext14d.length} 场</div>
+              <div class="tile-s">{preview.earningsNext14d.map((x) => `${x.ticker} ${x.date}`).join(" · ") || "窗口外，无避险动作"}</div>
+            </div>
+          </div>
+          {(driftHot.length > 0 || driftWarm.length > 0) && (
+            <div class="sep"></div>
+          )}
+          {driftHot.map((d) => (
+            <div class="sig" style="grid-template-columns:64px 1fr 90px">
+              <div class="n">{d.ticker}</div>
+              <div class="bar"><i style={`width:${Math.min(100, (Math.abs(d.driftPp) / (d.thresholdPp * 1.5)) * 100)}%;background:var(--down)`}></i></div>
+              <div class="v down strong">{d.driftPp >= 0 ? "+" : ""}{d.driftPp.toFixed(2)}pp</div>
+            </div>
+          ))}
+          {driftWarm.map((d) => (
+            <div class="sig" style="grid-template-columns:64px 1fr 90px">
+              <div class="n">{d.ticker}</div>
+              <div class="bar"><i style={`width:${Math.min(100, (Math.abs(d.driftPp) / (d.thresholdPp * 1.5)) * 100)}%;background:var(--yellow)`}></i></div>
+              <div class="v yel">{d.driftPp >= 0 ? "+" : ""}{d.driftPp.toFixed(2)}pp</div>
+            </div>
+          ))}
+        </>
+      ) : (
+        <div class="empty">还没有执行预告 —— 跑一轮 <code>npm run agent -- --mode {shadowMode}</code> 后生成</div>
+      )}
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-hd">
+      <h2>执行质量 · 实测滑点</h2><span class="hint">真实成交价 vs 同日收盘参考价</span>
+      <div class="right"><a href="/trades" class="chip">逐笔对照 →</a></div>
+    </div>
+    <div class="panel-bd">
+      {slip ? (
+        <>
+          <div class="tiles" style="grid-template-columns:repeat(3,1fr)">
+            <div class="tile">
+              <div class="tile-k">真实成交笔数</div>
+              <div class="tile-v sm">{slip.n}</div>
+              <div class="tile-s">mode=real · import-real 导入</div>
+            </div>
+            <div class="tile">
+              <div class="tile-k">加权平均滑点</div>
+              <div class="tile-v sm">{slip.bps.toFixed(1)} <span class="faint">bps</span></div>
+              <div class="tile-s">按名义额加权 · 回测成本模型假设 3bps 起步</div>
+            </div>
+            <div class="tile">
+              <div class="tile-k">最大单笔偏差</div>
+              <div class:list={["tile-v sm", slip.worst > 50 ? "down" : ""]}>{slip.worst.toFixed(1)} <span class="faint">bps</span></div>
+              <div class="tile-s">{slip.worst > 50 ? "单笔偏差偏大——检查是否用了市价单打流动性差时段" : "在模型假设范围内"}</div>
+            </div>
+          </div>
+          <div class="sep"></div>
+          <div class="panel-bd flush">
+            <table class="tbl">
+              <thead><tr><th class="l">日期</th><th class="l">标的</th><th>方向</th><th>数量</th><th>真实价</th><th>当日收盘</th><th>偏差</th></tr></thead>
+              <tbody>
+                {rv.slice(0, 5).map((r) => {
+                  const bps = (r.realPx / r.paperClose - 1) * 10_000;
+                  return (
+                    <tr>
+                      <td class="l dim">{r.date}</td>
+                      <td class="l t"><b>{r.ticker}</b></td>
+                      <td class:list={["l", r.units_delta >= 0 ? "up" : "down"]}>{r.units_delta >= 0 ? "▲ 买入" : "▼ 卖出"}</td>
+                      <td>{Math.abs(r.units_delta).toFixed(4)}</td>
+                      <td class="strong">{r.realPx.toFixed(2)}</td>
+                      <td class="dim">{r.paperClose.toFixed(2)}</td>
+                      <td class={Math.abs(bps) > 50 ? "down strong" : "dim"}>{bps >= 0 ? "+" : ""}{bps.toFixed(1)} bps</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : (
+        <div class="empty">
+          还没有真实成交 —— 券商导出 CSV（date,ticker,units_delta,price）后 <code>npm run import-real -- data/real/trades.csv</code>，这里给实测滑点与纸面的偏差归因。
+        </div>
+      )}
+    </div>
+  </div>
+</Base>

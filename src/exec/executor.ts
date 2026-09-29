@@ -13,16 +13,18 @@ import {
   latestPrices,
   loadPortfolio,
   loadRuntimeState,
+  loadUndeployedDeposits,
+  markDepositsDeployed,
   recordTrades,
   savePortfolio,
   saveRuntimeState,
   saveExecutorPreview,
-  upcomingEarnings,
-  latestAdv,
+  allEarningsByTicker,  latestAdv,
   upsertEarningsDates,
   getPool,
   usClosesByTicker,
 } from "../db/index.js";
+import { depositToUsd } from "../account/config.js";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { parseFredCsv } from "../data/stats.js";
 import type { Point } from "../data/stats.js";
@@ -44,7 +46,15 @@ export interface ExecutorConfig {
   /** 账本分区标签（paper），与回测的 backtest 分区区分 */
   mode: string;
   startCash: number;
+  /** weekly 注入模式的每周五定投额（deposits 模式忽略，注入额来自台账新入金） */
   dcaUsdt: number;
+  /**
+   * 注入模式：weekly = 每周五定投 dcaUsdt（paper 账本）；
+   * deposits = 部署台账里未打标的新入金（实盘影子账本，批次到账后下一轮自动按目标权重部署）
+   */
+  injectionMode?: "weekly" | "deposits";
+  /** deposits 模式下 CNY 入金缺 fx_rate 时的退回汇率（CNY/USD，取 account.json 的假设汇率） */
+  depositFxFallback?: number;
   driftThresholdPp: number;
   minTradeUsdt: number;
   /** 无成交量数据时的退回单边成本（百分比） */
@@ -73,6 +83,8 @@ export interface ExecutionSummary {
   composition: { regimeTarget: number; volMult: number | undefined; tilt: number | undefined };
   /** 本轮计提的现金利息（美元；未启用或无利率数据为 0） */
   cashInterestUsd: number;
+  /** 本轮注入的现金（美元）：weekly 定投额或 deposits 部署的台账入金折算；未注入为 0 */
+  injectionUsd: number;
   trades: {
     date: string;
     ticker: string;
@@ -161,6 +173,13 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   let workingCash = cash;
   let seeded = false;
   if (positions.size === 0 && cash === 0) {
+    if (cfg.injectionMode === "deposits") {
+      // 影子账本必须经 npm run account -- seed 播种——strategy.json 的 startCash 是 paper 的口径，
+      // 自动注入会让影子账本凭空长出一笔与真实入金无关的资金
+      throw new Error(
+        `账本 "${cfg.mode}" 为空：deposits 注入模式要求先播种（npm run account -- seed --cash <首批入金>）`,
+      );
+    }
     workingCash = cfg.startCash; // 首次运行：注入初始资金
     seeded = true;
   }
@@ -184,27 +203,45 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     return v;
   };
 
-  // 4) 定投引擎：仅周五注入，且当日未重复（以 dca 驱动标记去重）
+  // 4) 注入引擎：weekly = 每周五定投（paper 账本）；deposits = 部署台账未打标的新入金
+  //    （实盘影子账本——批次到账 npm run account -- record 后，下一次运行自动按目标权重部署）。
+  //    两种模式都以"当日已有 dca 成交"去重：若注入后打标写库前崩溃，重跑不会二次注资。
   let dcaApplied = false;
-  if (cfg.dcaUsdt > 0 && isFriday(asOf)) {
+  let injectionUsd = 0;
+  let pendingUsdSeen = 0;
+  let deployedDepositIds: number[] = [];
+  const dcaTradedToday = async (): Promise<boolean> => {
     const { rows } = await getPool().query<{ n: string }>(
       "select count(*)::text as n from trades where mode = $1 and reason like '%dca%' and date = $2",
       [cfg.mode, asOf],
     );
-    if ((rows[0]?.n ?? "0") === "0") {
-      workingCash += cfg.dcaUsdt;
+    return (rows[0]?.n ?? "0") !== "0";
+  };
+  if (cfg.injectionMode === "deposits") {
+    const pending = await loadUndeployedDeposits();
+    pendingUsdSeen = pending.reduce((s, e) => s + depositToUsd(e, cfg.depositFxFallback ?? 7.1), 0);
+    if (pendingUsdSeen > 0 && !(await dcaTradedToday())) {
+      workingCash += pendingUsdSeen;
+      injectionUsd = pendingUsdSeen;
       dcaApplied = true;
+      deployedDepositIds = pending.map((e) => e.id);
     }
+  } else if (cfg.dcaUsdt > 0 && isFriday(asOf) && !(await dcaTradedToday())) {
+    workingCash += cfg.dcaUsdt;
+    injectionUsd = cfg.dcaUsdt;
+    dcaApplied = true;
   }
 
-  // 5) 财报引擎：临近财报（前 N 天~后 M 天）的个股目标权重乘以缩放系数，余额留在现金筒
+  // 5) 财报引擎：临近财报（前 N 天~后 M 天）的个股目标权重乘以缩放系数，余额留在现金筒。
+  //    取全量财报日而非只取未来日期：restoreDaysAfter 的"财报后 M 天"窗口要能命中，
+  //    否则实盘比回测少覆盖一天的恢复期（两端口径必须一致）
   const earningsAffected: string[] = [];
   const scaleOf = new Map<string, number>(cfg.tickers.map((t) => [t, 1]));
-  const upcoming = await upcomingEarnings(cfg.tickers, asOf);
+  const earnDates = await allEarningsByTicker(cfg.tickers);
   if (cfg.earnings.enabled) {
     const afterDays = cfg.earnings.restoreDaysAfter;
     for (const t of cfg.tickers) {
-      for (const d of upcoming.get(t) ?? []) {
+      for (const d of earnDates.get(t) ?? []) {
         const diffDays = Math.round((Date.parse(d) - Date.parse(asOf)) / 86_400_000);
         if (diffDays <= cfg.earnings.riskOffDaysBefore && diffDays >= -afterDays) {
           scaleOf.set(t, cfg.earnings.scaleFactor);
@@ -247,6 +284,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
       composedEquityTarget,
       composition: { regimeTarget: regimePoint.equityTarget, volMult, tilt },
       cashInterestUsd,
+      injectionUsd,
       trades: [],
       equityAfter: 0,
       earningsAffected: [...new Set(earningsAffected)],
@@ -319,6 +357,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     await saveRuntimeState(cfg.mode, { regime: regimePoint.regime, equityTarget: regimePoint.equityTarget, score: regimePoint.score, asOf, sig: cfg.configSig });
     if (trades.length) await recordTrades(cfg.mode, trades);
     await saveExecutorPreview(cfg.mode, preview);
+    if (deployedDepositIds.length) await markDepositsDeployed(deployedDepositIds, cfg.mode);
   }
 
   return {
@@ -331,6 +370,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     composedEquityTarget,
     composition: { regimeTarget: regimePoint.equityTarget, volMult, tilt },
     cashInterestUsd,
+    injectionUsd,
     trades,
     equityAfter: equityOf(positions, workingCash),
     earningsAffected: [...new Set(earningsAffected)],
@@ -360,7 +400,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     }));
     const earningsNext14d: { ticker: string; date: string }[] = [];
     for (const t of cfg.tickers) {
-      for (const d of upcoming.get(t) ?? []) {
+      for (const d of earnDates.get(t) ?? []) {
         const diff = Math.round((Date.parse(d) - Date.parse(asOf)) / 86_400_000);
         if (diff >= 0 && diff <= 14) earningsNext14d.push({ ticker: t, date: d });
       }
@@ -379,7 +419,13 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
       },
       equity: Math.round(eq * 100) / 100,
       drifts,
-      nextFriday: cfg.dcaUsdt > 0 ? { date: nextFriday, injectionUsdt: cfg.dcaUsdt, planned: plannedDca } : null,
+      // weekly 模式才有"下周五定投"；deposits 模式注入由台账驱动，预告改为携带未部署余额
+      nextFriday:
+        cfg.injectionMode !== "deposits" && cfg.dcaUsdt > 0
+          ? { date: nextFriday, injectionUsdt: cfg.dcaUsdt, planned: plannedDca }
+          : null,
+      injectionMode: cfg.injectionMode ?? "weekly",
+      pendingDepositsUsdt: Math.round((pendingUsdSeen - injectionUsd) * 100) / 100,
       earningsNext14d,
     };
   }

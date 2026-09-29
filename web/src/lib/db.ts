@@ -89,15 +89,14 @@ export async function getRegimePoints(runId: number): Promise<RegimePointRow[]> 
   });
 }
 
-export async function getTrades(mode: string, limit = 100): Promise<TradeRow[]> {
-  return cached(`trades:${mode}:${limit}`, async () => {
-    const { rows } = await db.query<TradeRow>(
-      `select mode, to_char(date, 'YYYY-MM-DD') as date, ticker, units_delta, notional_usdt, reason,
+/** limit 缺省时取全量——paper 统计（定投次数/买卖累计）不能被截断悄悄偏小 */
+export async function getTrades(mode: string, limit?: number): Promise<TradeRow[]> {
+  return cached(`trades:${mode}:${limit ?? "all"}`, async () => {
+    const sql = `select mode, to_char(date, 'YYYY-MM-DD') as date, ticker, units_delta, notional_usdt, reason,
               coalesce(cost_usdt, 0)::float as "costUsdt",
               to_char(created_at at time zone 'UTC', 'MM-DD HH24:MI:SS') as "createdAt"
-       from trades where mode = $1 order by date desc, created_at desc, id desc limit $2`,
-      [mode, limit],
-    );
+       from trades where mode = $1 order by date desc, created_at desc, id desc${limit ? " limit $2" : ""}`;
+    const { rows } = await db.query<TradeRow>(sql, limit ? [mode, limit] : [mode]);
     return rows;
   });
 }
@@ -107,7 +106,7 @@ export async function getRunTrades(runId: number): Promise<TradeRow[]> {
   return cached(`runTrades:${runId}`, async () => {
     const { rows } = await db.query<TradeRow>(
       `select mode, to_char(date, 'YYYY-MM-DD') as date, ticker, units_delta, notional_usdt, reason
-       from trades where mode = 'backtest' and run_id = $1 order by date, ticker`,
+       from trades where mode = 'backtest' and run_id = $1 order by date, id`,
       [runId],
     );
     return rows;
@@ -362,6 +361,10 @@ export interface ExecutorPreview {
   equity: number;
   drifts: { ticker: string; driftPp: number; thresholdPp: number }[];
   nextFriday: { date: string; injectionUsdt: number; planned: { ticker: string; usdt: number }[] } | null;
+  /** deposits 注入模式（影子账本）才有意义：weekly 定投 | 台账新入金驱动 */
+  injectionMode?: "weekly" | "deposits";
+  /** 预告生成时的未部署入金折算（美元）；deposits 模式下轮部署的就是它 */
+  pendingDepositsUsdt?: number;
   earningsNext14d: { ticker: string; date: string }[];
 }
 
@@ -395,4 +398,71 @@ export async function getRealVsPaper(): Promise<RealVsPaperRow[]> {
     );
     return rows;
   });
+}
+
+/* ---------- 实盘部署：账户台账与账本净值重放 ---------- */
+
+export interface AccountEventRow {
+  id: number;
+  occurredAt: string;
+  /** deposit / withdraw / fx / fee / tax / other */
+  kind: string;
+  /** 带方向：入金正、出金负 */
+  amount: number;
+  currency: string;
+  fxRate: number | null;
+  note: string | null;
+}
+
+export async function getAccountEvents(): Promise<AccountEventRow[]> {
+  return cached("accountEvents", async () => {
+    const { rows } = await db.query<AccountEventRow>(
+      `select id, to_char(occurred_at, 'YYYY-MM-DD') as "occurredAt", kind, amount, currency,
+              fx_rate as "fxRate", note
+       from account_events order by occurred_at desc, id desc`,
+    );
+    return rows;
+  });
+}
+
+export interface PendingDepositRow {
+  id: number;
+  occurredAt: string;
+  amount: number;
+  currency: string;
+  fxRate: number | null;
+  note: string | null;
+}
+
+/** 待部署新入金（deployed_at 为空的 deposit）：影子账本执行器下一轮的注入源 */
+export async function getUndeployedDeposits(): Promise<PendingDepositRow[]> {
+  return cached("pendingDeposits", async () => {
+    const { rows } = await db.query<PendingDepositRow>(
+      `select id, to_char(occurred_at, 'YYYY-MM-DD') as "occurredAt", amount, currency, fx_rate as "fxRate", note
+       from account_events
+       where kind = 'deposit' and deployed_at is null
+       order by occurred_at, id`,
+    );
+    return rows;
+  });
+}
+
+/**
+ * 指定日期之后的收盘价（ticker → date → close），账本净值重放用。
+ * 按 ticker 逐只查：全表一把拉 4 万+ 行会撞 Supabase statement timeout（57014）——与 src 侧同因同解。
+ */
+export async function getClosesSince(
+  tickers: string[],
+  since: string,
+): Promise<Map<string, Map<string, number>>> {
+  const out = new Map<string, Map<string, number>>();
+  for (const ticker of tickers) {
+    const { rows } = await db.query<{ d: string; close: number }>(
+      `select to_char(date, 'YYYY-MM-DD') as d, close from prices
+       where ticker = $1 and date >= $2::date order by date`,
+      [ticker, since],
+    );
+    if (rows.length) out.set(ticker, new Map(rows.map((r) => [r.d, r.close])));
+  }
+  return out;
 }

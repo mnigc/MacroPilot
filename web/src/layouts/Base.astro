@@ -14,6 +14,14 @@ const items = [
     icon: '<path d="M3 3h7v7H3zM14 3h7v4h-7zM14 10h7v11h-7zM3 13h7v8H3z"/>',
   },
   {
+    href: "/engines", key: "engines", label: "策略引擎",
+    icon: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+  },
+  {
+    href: "/deploy", key: "deploy", label: "实盘部署",
+    icon: '<rect x="2.5" y="6" width="19" height="13" rx="2.5"/><path d="M2.5 10.5h19"/><path d="M15.5 14.5h3"/>',
+  },
+  {
     href: "/backtest", key: "backtest", label: "回测实验室",
     icon: '<path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-7"/>',
   },
@@ -163,7 +171,7 @@ const execLabel = !fresh.agent.at
     <script>
       /**
        * 长表分页。静态站点没有服务端，切片只能在前端做：给 <table data-paginate> 用，
-       * 每页行数取 data-page-size（默认 20），可切 20 / 50 / 100 / 全部。
+       * 每页行数取 data-page-size（默认 20），档位 = 自身档 + 20 / 50 / 100 / 全部。
        *
        * 和外部筛选共存：筛选（交易流水的引擎标签）用 row.hidden，本脚本用 .pg-hide，
        * 两套隐藏互不覆盖；筛选变化由 MutationObserver 接住，并退回第 1 页。
@@ -195,6 +203,8 @@ const execLabel = !fresh.agent.at
 
         let size = Number(table.dataset.pageSize) || PG_SIZES[0].v;
         let page = 1;
+        /** 自身的档位排最前，保证"每页行数"下拉能切回默认值 */
+        const sizes = PG_SIZES.some((s) => s.v === size) ? PG_SIZES : [{ v: size, label: String(size) }, ...PG_SIZES];
 
         const bar = document.createElement("div");
         bar.className = "pager";
@@ -216,7 +226,7 @@ const execLabel = !fresh.agent.at
           }
 
           // 一页装得下就不摆控件；但要保住"每页行数"下拉，所以阈值取最小档
-          bar.hidden = pool.length <= PG_SIZES[0].v;
+          bar.hidden = pool.length <= sizes[0].v;
           bar.replaceChildren();
           if (bar.hidden) return;
           slice[slice.length - 1]?.classList.add("pg-last");
@@ -253,7 +263,7 @@ const execLabel = !fresh.agent.at
 
           const sel = document.createElement("select");
           sel.setAttribute("aria-label", "每页行数");
-          for (const s of PG_SIZES) {
+          for (const s of sizes) {
             const o = document.createElement("option");
             o.value = String(s.v);
             o.textContent = s.label;

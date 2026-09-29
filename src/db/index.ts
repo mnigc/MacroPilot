@@ -106,6 +106,23 @@ export async function initSchema(): Promise<void> {
     );
     -- 策略配置签名：配置变更 → 执行器立即对齐新目标表（retarget），不等漂移阈值
     alter table runtime_state add column if not exists sig text;
+    -- 实盘账户资金流水（入金/出金/换汇/费用/税）：账户层唯一的事实源。
+    -- amount 带方向（入金+、出金-）；currency 为金额币种；fx_rate 记录事件当时的 CNY/USD 汇率
+    -- （换汇与 CNY 金额折算用）。购汇额度占用由 deposit 流水按年汇总，不单独存状态。
+    create table if not exists account_events (
+      id serial primary key,
+      created_at timestamptz not null default now(),
+      occurred_at date not null,
+      kind text not null,
+      amount double precision not null,
+      currency text not null,
+      fx_rate double precision,
+      note text
+    );
+    -- 入金被执行器消费（部署进影子账本）的标记：deployed_at 为空即"待部署新入金"，
+    -- 执行器在 deposits 注入模式下一轮全部消费并打标（幂等去重的第二道防线）
+    alter table account_events add column if not exists deployed_at timestamptz;
+    alter table account_events add column if not exists deployed_mode text;
   `);
 }
 
@@ -501,6 +518,71 @@ export async function saveRuntimeState(mode: string, state: RuntimeState): Promi
      on conflict (mode) do update set regime = excluded.regime, equity_target = excluded.equity_target,
        score = excluded.score, as_of = excluded.as_of, sig = excluded.sig, updated_at = now()`,
     [mode, state.regime, state.equityTarget, state.score, state.asOf, state.sig ?? null],
+  );
+}
+
+/* ---------- 实盘账户台账 ---------- */
+
+export interface AccountEvent {
+  id: number;
+  occurredAt: string;
+  /** deposit / withdraw / fx / fee / tax / other */
+  kind: string;
+  /** 带方向：入金正、出金负 */
+  amount: number;
+  currency: string;
+  fxRate: number | null;
+  note: string | null;
+  /** 被执行器部署进账本的时刻（UTC）；null = 待部署新入金 */
+  deployedAt?: string | null;
+}
+
+export async function saveAccountEvent(e: Omit<AccountEvent, "id">): Promise<void> {
+  await getPool().query(
+    "insert into account_events (occurred_at, kind, amount, currency, fx_rate, note) values ($1, $2, $3, $4, $5, $6)",
+    [e.occurredAt, e.kind, e.amount, e.currency, e.fxRate ?? null, e.note ?? null],
+  );
+}
+
+export async function loadAccountEvents(): Promise<AccountEvent[]> {
+  const { rows } = await getPool().query<{
+    id: number;
+    occurred_at: string;
+    kind: string;
+    amount: number;
+    currency: string;
+    fx_rate: number | null;
+    note: string | null;
+    deployed_at: string | null;
+  }>(
+    `select id, to_char(occurred_at, 'YYYY-MM-DD') as occurred_at, kind, amount, currency, fx_rate, note,
+            to_char(deployed_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as deployed_at
+     from account_events order by occurred_at desc, id desc`,
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    occurredAt: r.occurred_at,
+    kind: r.kind,
+    amount: r.amount,
+    currency: r.currency,
+    fxRate: r.fx_rate,
+    note: r.note,
+    deployedAt: r.deployed_at,
+  }));
+}
+
+/** 待部署的新入金（deployed_at 为空的 deposit）：影子账本执行器的注入源 */
+export async function loadUndeployedDeposits(): Promise<AccountEvent[]> {
+  const all = await loadAccountEvents();
+  return all.filter((e) => e.kind === "deposit" && e.deployedAt === null);
+}
+
+/** 入金消费打标：执行器把未部署入金注入账本后调用（dry-run 不打标） */
+export async function markDepositsDeployed(ids: number[], mode: string): Promise<void> {
+  if (!ids.length) return;
+  await getPool().query(
+    "update account_events set deployed_at = now(), deployed_mode = $2 where id = any($1::int[])",
+    [ids, mode],
   );
 }
 
