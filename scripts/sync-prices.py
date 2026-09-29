@@ -25,8 +25,9 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 EARNINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def sync_earnings(ticker: str, retries: int = 3) -> int:
-    """同步财报日期：未来几季（执行器避险窗口）+ 尽量多的历史（回测财报引擎）。"""
+def sync_earnings(ticker: str, retries: int = 3) -> int | None:
+    """同步财报日期：未来几季（执行器避险窗口）+ 尽量多的历史（回测财报引擎）。
+    失败返回 None——与"成功但为空"区分开，部分失败不能再静默绿灯。"""
     last: Exception | None = None
     for attempt in range(retries):
         try:
@@ -45,7 +46,7 @@ def sync_earnings(ticker: str, retries: int = 3) -> int:
             last = exc
             time.sleep(10 * (attempt + 1))
     print(f"{ticker}: earnings sync FAILED after {retries} attempts ({last})")
-    return 0
+    return None
 
 
 def _col(df, name: str):
@@ -88,7 +89,14 @@ if __name__ == "__main__":
         failed = [t for t, ok in results.items() if not ok]
         if failed:
             raise SystemExit(f"price sync failed: {failed}")
-    earnings_total = sum(sync_earnings(t) for t in TICKERS)
+    earn_results = {t: sync_earnings(t) for t in TICKERS}
+    earn_failed = [t for t, r in earn_results.items() if r is None]
+    earnings_total = sum(r or 0 for r in earn_results.values())
     print(f"earnings dates total: {earnings_total}")
+    if earn_failed:
+        # 部分失败也要亮出来：那几只的日历静默变陈旧，执行器的财报避险会漏掉它们
+        print(f"⚠ earnings sync FAILED for: {', '.join(earn_failed)} —— 这几只日历将保持陈旧")
+        if earnings_only:
+            raise SystemExit(f"earnings sync failed: {earn_failed}")
     if earnings_total == 0:
         raise SystemExit("财报日历为空：财报引擎不会触发。多为 Yahoo 按 IP 限流，改由 CI 执行。")

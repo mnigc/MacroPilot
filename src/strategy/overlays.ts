@@ -54,31 +54,22 @@ export function volMultiplierSeries(
 ): (number | undefined)[] {
   const lookups = [...closesByTicker.values()].map(carryLookup);
   const n = lookups.length;
-  const px = (i: number) => {
-    let sum = 0;
-    let cnt = 0;
-    for (const l of lookups) {
-      const v = l(calendar[i] as string);
-      if (v !== undefined) {
-        sum += v;
-        cnt++;
-      }
-    }
-    return cnt === n && n > 0 ? sum / n : undefined;
-  };
+  /** 各标的截至前一交易日的 carried 收盘：等权收益要逐标的的前收，不能直接对价格求和 */
+  const prevPrices: (number | undefined)[] = new Array(n).fill(undefined);
 
-  const rets: number[] = []; // 与 calendar 对齐的篮子日收益（前 lookback+1 日为 undefined）
+  const rets: number[] = []; // 与 calendar 对齐的篮子日收益（前 lookback+1 日为 NaN）
   const out: (number | undefined)[] = [];
-  let prevPx: number | undefined;
 
   for (let i = 0; i < calendar.length; i++) {
-    const cur = px(i);
-    if (cur === undefined || prevPx === undefined || prevPx <= 0) {
-      rets.push(NaN);
-    } else {
-      rets.push(cur / prevPx - 1);
+    const curs = lookups.map((l) => l(calendar[i] as string));
+    let basketRet: number | undefined;
+    // 等权篮子：先逐标的算收益再平均。直接对价格求和取比值是价格加权（道指式），
+    // 权重会偏向股价最高的标的，与"等权篮子"的口径和实际持仓方式都不符
+    if (n > 0 && curs.every((v) => v !== undefined) && prevPrices.every((v) => v !== undefined && v > 0)) {
+      basketRet = lookups.reduce((a, _l, k) => a + (curs[k] as number) / (prevPrices[k] as number) - 1, 0) / n;
     }
-    prevPx = cur ?? prevPx;
+    rets.push(basketRet !== undefined ? basketRet : NaN);
+    for (let k = 0; k < n; k++) prevPrices[k] = curs[k] ?? prevPrices[k];
 
     // 滚动窗口：最近 lookbackDays 个有效收益
     if (i < cfg.lookbackDays) {
@@ -156,8 +147,6 @@ export function latestVolMultiplier(
   if (minLen < cfg.lookbackDays + 1) return undefined;
   const rets: number[] = [];
   for (let i = minLen - cfg.lookbackDays; i < minLen; i++) {
-    let sumPrev = 0;
-    let sumCur = 0;
     let ok = true;
     for (const arr of closesByTicker.values()) {
       const prev = arr[i - 1];
@@ -166,10 +155,13 @@ export function latestVolMultiplier(
         ok = false;
         break;
       }
-      sumPrev += prev;
-      sumCur += cur;
     }
-    if (ok) rets.push(sumCur / sumPrev - 1);
+    // 等权：逐标的收益取平均（对价格求和取比值是价格加权，权重偏向高价股）
+    if (ok) {
+      let acc = 0;
+      for (const arr of closesByTicker.values()) acc += (arr[i] as number) / (arr[i - 1] as number) - 1;
+      rets.push(acc / n);
+    }
   }
   if (rets.length < Math.max(10, cfg.lookbackDays * 0.6)) return undefined;
   const mean = rets.reduce((a, b) => a + b, 0) / rets.length;

@@ -77,6 +77,17 @@ const SMA_WINDOW = 200; // 长趋势均线
 export const WARMUP_DAYS = RANK_WINDOW + CHANGE_LAG + 1; // 第一个可用信号日
 
 /**
+ * UNRATE 发布滞后（自然日）：FRED 把观测戳记在参考月 1 号，但就业报告要到次月第一个
+ * 周五才发布——戳记当日数据尚不存在。不加这个滞后，回测里 Sahm 门会提前约一个月
+ * "知道"衰退信号（实盘执行器只拿已发布数据，无此问题，但回测会因此虚高）。
+ * 首个周五落在次月 3~9 号，即距戳记 33~39 天，取 35 为中位近似。
+ */
+const UNRATE_PUBLICATION_LAG_DAYS = 35;
+
+const minusDays = (date: string, days: number): string =>
+  new Date(Date.parse(date) - days * 86_400_000).toISOString().slice(0, 10);
+
+/**
  * 三态滞回（Schmitt 触发）单步：进入极态要越过外沿，回到中性要越过内沿 release。
  * 独立成函数是因为这条规则本身出过 bug——只写"进入极态"边沿时 neutral 一旦离开
  * 便永久不可达（实测 0 天），因此必须可被单测钉住。
@@ -224,11 +235,12 @@ export function computeRegimeTimeline(bundle: MacroBundle, cfg: RegimeConfig): R
 
     regime = nextRegime(score, regime, cfg);
 
-    // Sahm 确认门：读数用"截至当日的可用观测"（step-carry 后按序列尾部计算）
+    // Sahm 确认门：读数用"截至当日的可用观测"（step-carry 后按序列尾部计算）。
+    // 可用 = 发布滞后内推：参考月 M 的失业率最早在 M+35 天才公开，此前不得进入窗口
     let sahm: number | null = null;
     let gateActive = false;
     if (bundle.labor && bundle.labor.length) {
-      const obs = bundle.labor.filter((p) => p.date <= date);
+      const obs = bundle.labor.filter((p) => p.date <= minusDays(date, UNRATE_PUBLICATION_LAG_DAYS));
       sahm = sahmRule(obs);
       gateActive = sahm !== null && sahm >= (cfg.gate?.sahmThreshold ?? 0.5);
     }

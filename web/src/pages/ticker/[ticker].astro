@@ -96,7 +96,7 @@ const fmtUsd = (v: number, d = 0) => `$${Math.abs(v).toLocaleString("en-US", { m
 const fmtSigned = (v: number, d = 0) => `${v >= 0 ? "+" : "−"}${fmtUsd(v, d)}`;
 const fmtPct = (v: number, d = 2) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(d)}%`;
 const cls = (v: number) => (v >= 0 ? "up" : "down");
-/** 全部成交，按日期倒序——分页交给前端的 data-paginate，不再截断 */
+/** 全部成交，按日期倒序——分页交给前端的 data-paginate（每页 15 条，免得右栏把 K 线行撑高），不再截断 */
 const desc = [...marks].reverse();
 const buyCount = marks.length - sells;
 const hi52 = Math.max(...closes.slice(-252));
@@ -172,7 +172,7 @@ const tiles: { k: string; v: string; s: string; c?: string }[] = [
     <section class="panel">
       <div class="panel-hd"><h2>成交明细</h2><span class="hint">按日期倒序 · 共 {marks.length} 笔</span></div>
       <div class="panel-bd flush">
-        <table class="tbl" data-paginate>
+        <table class="tbl" data-paginate data-page-size="15">
           <thead><tr><th class="l">日期</th><th class="l">方向</th><th>成交价</th><th>金额</th><th class="r">盈亏</th></tr></thead>
           <tbody>
             {desc.map((t) => (

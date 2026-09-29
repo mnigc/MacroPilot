@@ -8,7 +8,8 @@ const dcaUsdt = (JSON.parse(readFileSync("../config/strategy.json", "utf8")) as 
   engines: { dca: { amountUsdt: number } };
 }).engines.dca.amountUsdt;
 
-const paperTrades = await getTrades("paper", 200);
+// 全量取：本页既是明细表也是统计页（归因/买卖累计/定投次数），截断会全部悄悄偏小
+const paperTrades = await getTrades("paper");
 const backtestTrades = await getTrades("backtest", 60);
 const executor = await getExecutorRun("paper");
 const realVsPaper = await getRealVsPaper();

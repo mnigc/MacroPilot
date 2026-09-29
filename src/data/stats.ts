@@ -87,16 +87,19 @@ export function parseFredCsv(csv: string): Point[] {
  */
 export function parsePriceCsv(csv: string): Point[] {
   const lines = csv.trim().split(/\r?\n/);
-  const head = (lines[0] ?? "").split(",").map((s) => s.trim().toLowerCase());
+  // 表头去 BOM：带 \ufeff 的文件 indexOf("date") 会失败，整只股票被静默跳过
+  const head = (lines[0] ?? "").replace(/^\ufeff/, "").split(",").map((s) => s.trim().toLowerCase());
   const di = Math.max(0, head.indexOf("date"));
   const ci = head.includes("close") ? head.indexOf("close") : head.indexOf("value");
   const out: Point[] = [];
   if (ci < 0) return out;
   for (let i = 1; i < lines.length; i++) {
     const cols = (lines[i] ?? "").split(",");
-    const date = cols[di];
-    const value = Number(cols[ci]);
-    if (date && Number.isFinite(value)) out.push({ date, value });
+    const date = cols[di]?.trim();
+    // Number("") === 0：空 close 不排除会写成 0 价（与 parseFredCsv 同一个坑）
+    const raw = cols[ci]?.trim();
+    const value = raw !== undefined && raw !== "" && raw !== "." ? Number(raw) : NaN;
+    if (date && Number.isFinite(value) && value > 0) out.push({ date, value });
   }
   return out;
 }

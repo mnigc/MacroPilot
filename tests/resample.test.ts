@@ -105,10 +105,10 @@ describe("月度矩阵与滚动夏普", () => {
     expect(row.months[3]).toBeCloseTo(0.1, 10);
   });
 
-  it("滚动夏普长度 = 收益样本数 − 窗口", () => {
+  it("滚动夏普长度 = 收益样本数 − 窗口 + 1（每个窗口恰为 252 个收益）", () => {
     const equity = Array.from({ length: 400 }, (_, i) => ({ date: `d${i}`, value: 100 + i }));
     const rs = rollingSharpe(equity, 252);
-    expect(rs.length).toBe(399 - 252);
+    expect(rs.length).toBe(399 - 252 + 1);
   });
 
   it("dailyReturns 与净值曲线逐日对应", () => {

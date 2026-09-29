@@ -37,9 +37,11 @@ const params = (run?.params ?? {}) as {
   earningsWindow?: { daysBefore: number; daysAfter: number; scale: number };
 };
 
-const fmtPct = (v: number, digits = 1) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(digits)}%`;
+const fmtPct = (v: number | null | undefined, digits = 1) => v == null || !Number.isFinite(v) ? "—" : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(digits)}%`;
 /** 仓位/占比不是"涨跌"，不带正负号 —— 和 fmtPct 分开，避免把 100% 目标仓位写成 +100% */
-const fmtRatio = (v: number, digits = 0) => `${(v * 100).toFixed(digits)}%`;
+const fmtRatio = (v: number | null | undefined, digits = 0) => v == null || !Number.isFinite(v) ? "—" : `${(v * 100).toFixed(digits)}%`;
+/** 三腿对照单元格：老 run 缺 annualVol 这类可选字段时显示 — 而不是 NaN% */
+const fmtCell = (v: number | null | undefined, pct?: boolean) => v == null || !Number.isFinite(v) ? "—" : pct ? fmtPct(v) : v.toFixed(2);
 const fmtUsd = (v: number) => `$${v.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
 const release = params.scoreRelease ?? ((params.scoreHigh ?? 0.6) + (params.scoreLow ?? 0.3)) / 2;
 
@@ -206,7 +208,7 @@ const ciRows = bootstrap
         <div class="tile">
           <div class="tile-k">最大回撤</div>
           <div class="tile-v down">{fmtPct(run.metrics.strategy.maxDrawdown)}</div>
-          <div class="tile-s">基准 {fmtPct(run.metrics.benchmark.maxDrawdown)} · <span class="delta up">改善 {((run.metrics.benchmark.maxDrawdown - run.metrics.strategy.maxDrawdown) * 100).toFixed(1)}pp</span></div>
+          <div class="tile-s">基准 {fmtPct(run.metrics.benchmark.maxDrawdown)} · <span class:list={["delta", run.metrics.strategy.maxDrawdown >= run.metrics.benchmark.maxDrawdown ? "up" : "down"]}>改善 {((run.metrics.strategy.maxDrawdown - run.metrics.benchmark.maxDrawdown) * 100).toFixed(1)}pp</span></div>
         </div>
         <div class="tile">
           <div class="tile-k">夏普比率</div>
@@ -235,9 +237,9 @@ const ciRows = bootstrap
                 {compare.map((c) => (
                   <tr>
                     <td class="l t">{c.k}</td>
-                    <td class="strong">{c.pct ? fmtPct(c.s) : c.s.toFixed(2)}</td>
-                    <td class="dim">{c.pct ? fmtPct(c.b) : c.b.toFixed(2)}</td>
-                    <td class="dim">{c.c === null ? "—" : c.pct ? fmtPct(c.c) : c.c.toFixed(2)}</td>
+                    <td class="strong">{fmtCell(c.s, c.pct)}</td>
+                    <td class="dim">{fmtCell(c.b, c.pct)}</td>
+                    <td class="dim">{fmtCell(c.c, c.pct)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -281,8 +283,11 @@ const ciRows = bootstrap
 
       <div class="panel" style="margin-top:12px">
         <div class="panel-hd">
-          <h2>净值曲线</h2><span class="hint">色带 = 宏观体制 · 底部滑块可缩放</span>
-          <div class="right"><span class="chip">初始 {fmtUsd(startCash)}</span><span class="chip">每周 {fmtUsd(params.dcaUsdt ?? 0)}</span></div>
+          <h2>净值曲线</h2><span class="hint">同现金流：初始 {fmtUsd(startCash)} + 每周 {fmtUsd(params.dcaUsdt ?? 0)} · 色带 = 宏观体制 · 底部滑块可缩放</span>
+          <div class="right">
+            <span class="chip">策略夏普 {run.metrics.strategy.sharpe.toFixed(2)}</span>
+            <span class="chip">基准夏普 {run.metrics.benchmark.sharpe.toFixed(2)}</span>
+          </div>
         </div>
         <div class="panel-bd"><EquityChart client:load strategy={run.equity.strategy} benchmark={run.equity.benchmark} benchmark6040={run.equity.benchmark6040} bands={bands} tall /></div>
       </div>

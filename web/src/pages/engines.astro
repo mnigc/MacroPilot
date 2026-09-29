@@ -1,0 +1,147 @@
+---
+import Base from "../layouts/Base.astro";
+import { REGIME_LABEL } from "../lib/bands";
+import { getEngineState, fmtUsd, fmtPct, type Tok } from "../lib/engineState";
+
+/**
+ * 策略引擎页：六模块各自读到什么、规则是什么、离动作多远，加上财报排程与历史类比。
+ * 账户状态在仪表盘，统计验证在回测实验室——这里只回答"引擎们现在怎么样"。
+ */
+const {
+  e, run, latest, cover, nextEarn, inWindow, analog,
+  regime, score, edge, switches90, nextFriday, dcaCount,
+  volMultNow, tiltNow, capeReady, maxDrift, drifted, rows,
+} = await getEngineState();
+
+const engines: { cls: string; name: string; rule: string; icon: string; state: Tok[] }[] = [
+  {
+    cls: "y", name: "定投引擎", rule: `每周五注入 ${fmtUsd(e.dca.amountUsdt)}，按当期目标权重买入`,
+    icon: '<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>',
+    state: ["下次 ", { b: nextFriday }, " · 已执行 ", { b: String(dcaCount) }, " 次"],
+  },
+  {
+    cls: "g", name: "体制引擎", rule: "五信号百分位加权 → 综合分 → 三态滞回决定总仓位",
+    icon: '<circle cx="12" cy="12" r="9"/><path d="M12 12l4.5-4.5"/><path d="M12 21v-3"/>',
+    state: [`${REGIME_LABEL[regime]} `, { b: `${((latest?.equity_target ?? 0) * 100).toFixed(0)}%` }, ` · ${edge.label} `, { b: edge.v.toFixed(3) }, " · 近 90 天切换 ", { b: String(switches90) }, " 次"],
+  },
+  {
+    cls: "b", name: "波动率目标", rule: `${e.volTarget ? (e.volTarget.targetVol * 100).toFixed(0) : 15}% 已实现波动之上按比例减仓（不杠杆）`,
+    icon: '<path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/>',
+    state: volMultNow === null
+      ? ["乘数 ", { b: "—" }, " · 无读数（按 1 处理）"]
+      : ["乘数 ", { b: `×${volMultNow.toFixed(2)}`, cls: volMultNow < 0.9 ? "down" : "up" }, ` · 目标仓位贡献 ${((volMultNow - 1) * 100).toFixed(0)}%`],
+  },
+  {
+    cls: capeReady ? "p" : "w", name: "估值锚", rule: "CAPE 滚动百分位 → ±15% 线性偏移（贵时少买，便宜时多买）",
+    icon: '<path d="M12 2v20M2 12h20"/><circle cx="12" cy="12" r="9"/>',
+    state: !capeReady
+      ? [{ b: "⚠ CAPE 未同步", cls: "down" }, "，引擎按关闭处理"]
+      : tiltNow === null
+        ? ["偏移 ", { b: "—" }, " · 无读数"]
+        : ["偏移 ", { b: `${tiltNow >= 0 ? "+" : ""}${(tiltNow * 100).toFixed(1)}%`, cls: tiltNow >= 0 ? "up" : "down" }, " · 贵时收敛、便宜时扩张"],
+  },
+  {
+    cls: "p", name: "漂移引擎", rule: `任一标的权重偏离目标 ±${e.drift.thresholdPp}pp 即拉回，抑制磨损`,
+    icon: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+    state: ["最大偏离 ", { b: `${maxDrift.toFixed(2)}pp` }, " · 超阈值 ", { b: String(drifted) }, `/${rows.length} 只`],
+  },
+  {
+    cls: cover.rows === 0 ? "w" : "b", name: "财报引擎", rule: `财报前 ${e.earnings.riskOffDaysBefore} 天该股权重 ×${e.earnings.scaleFactor}，后 ${e.earnings.restoreDaysAfter} 天恢复`,
+    icon: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h16.9a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
+    state: cover.rows === 0
+      ? [{ b: "⚠ 日历为空", cls: "down" }, "，引擎不会触发"]
+      : ["日历 ", { b: String(cover.rows) }, " 条 · 下一场 ", { b: nextEarn[0]?.ticker ?? "—" }, ` T-${nextEarn[0]?.daysAway ?? "—"} · 窗口内 `, { b: String(nextEarn.filter((n) => inWindow(n.ticker)).length) }, " 只"],
+  },
+];
+---
+<Base active="engines" crumb="策略引擎" sub="六模块各自读到什么、规则是什么、离动作多远">
+  <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
+    <span class:list={["badge", regime]}><span class="dot"></span>{REGIME_LABEL[regime]} · {score.toFixed(3)}</span>
+    <span class="chip">回测 run #{run?.id ?? "—"}</span>
+  </div>
+
+  {cover.rows === 0 && (
+    <div class="note bad" style="margin-top:12px">
+      <span class="ic">⚠</span>
+      <div><b>财报日历为空</b>（earnings_dates 0 行）——财报引擎不会触发，任何"无临近财报"的读数都不成立。运行 <code>python scripts/sync-prices.py --earnings-only</code> 或由 sync-data workflow 同步。</div>
+    </div>
+  )}
+
+  <div class="grid g-3" style="margin-top:12px">
+    {engines.map((eng) => (
+      <div class="eng">
+        <div class:list={["eng-ic", eng.cls]}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" set:html={eng.icon} /></div>
+        <div style="min-width:0">
+          <h3>{eng.name}</h3>
+          <div class="rule">{eng.rule}</div>
+          <div class="state">{eng.state.map((tk) => (typeof tk === "string" ? tk : <b class={tk.cls}>{tk.b}</b>))}</div>
+        </div>
+      </div>
+    ))}
+  </div>
+
+  <div class="grid g-2" style="margin-top:12px">
+    <div class="panel">
+      <div class="panel-hd"><h2>财报排程</h2><span class="hint">未来 60 天</span></div>
+      <div class="panel-bd flush">
+        {nextEarn.length === 0 ? (
+          <div class="empty">{cover.rows === 0 ? "财报日历未同步" : "未来 60 天篮子内无财报"}</div>
+        ) : (
+          <table class="tbl">
+            <thead><tr><th class="l">标的</th><th>日期</th><th>倒计时</th><th class="l">引擎动作</th></tr></thead>
+            <tbody>
+              {nextEarn.map((n) => (
+                <tr>
+                  <td class="l t"><b>{n.ticker}</b></td>
+                  <td class="dim">{n.date}</td>
+                  <td class={n.daysAway <= 5 ? "down strong" : n.daysAway <= 10 ? "yel" : ""}>T-{n.daysAway}</td>
+                  <td class="l faint">{inWindow(n.ticker) ? <span class="pill earnings">已减半 ×{e.earnings.scaleFactor}</span> : `前 ${e.earnings.riskOffDaysBefore} 天减半`}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      <div class="panel-bd" style="padding-top:0">
+        <div class="faint" style="line-height:1.65">
+          引擎动作 = 财报窗口内该标的目标权重 ×{e.earnings.scaleFactor}，{e.earnings.restoreDaysAfter} 天后恢复；
+          窗口判定与仪表盘持仓表、下轮预告同源。
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <h2>历史类比</h2><span class="hint">宏观综合分形态最像现在的历史窗口 · 之后发生了什么</span>
+        <div class="right">{analog?.asOf && (<><span class="faint">当前窗口截至 {analog.asOf} · 现行体制 </span><span class={`badge ${regime}`}>{REGIME_LABEL[regime]}</span><span class="faint">（综合分 {score.toFixed(2)}）</span></>)}</div>
+      </div>
+      <div class="panel-bd flush">
+        {analog && analog.windows.length ? (
+          <table class="tbl">
+            <thead><tr><th class="l">窗口</th><th title="形态距离：与当前窗口（最近 60 天）综合分形态的归一化均方根差，越小越像；最像的排最前">相似度</th><th title="窗口结束后 63 个交易日，基准腿（篮子等权买入持有）收益">后 3 月</th><th title="窗口结束后 126 个交易日，基准腿收益">后 6 月</th><th title="窗口结束后 252 个交易日，基准腿收益">后 12 月</th></tr></thead>
+            <tbody>
+              {analog.windows.map((w) => (
+                <tr>
+                  <td class="l dim">{w.start} → {w.end}</td>
+                  <td class="dim" title="越小越像">{w.distance.toFixed(3)}</td>
+                  <td class={w.fwd63 === null ? "faint" : w.fwd63 >= 0 ? "up" : "down"}>{w.fwd63 === null ? "—" : fmtPct(w.fwd63)}</td>
+                  <td class={w.fwd126 === null ? "faint" : w.fwd126 >= 0 ? "up" : "down"}>{w.fwd126 === null ? "—" : fmtPct(w.fwd126)}</td>
+                  <td class={w.fwd252 === null ? "faint" : w.fwd252 >= 0 ? "up" : "down"}>{w.fwd252 === null ? "—" : fmtPct(w.fwd252)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <div class="empty">暂无类比数据 —— 跑一轮 <code>npm run backtest</code> 生成</div>
+        )}
+      </div>
+      <div class="panel-bd" style="padding-top:0">
+        <div class="faint" style="line-height:1.65">
+          每行是历史上一段 60 个交易日的综合分形态，与当前窗口（最近 60 天）逐日比对（归一化欧氏距离，步长 5 天采样），最像的排最前。
+          相似度列即形态距离，<b>越小越像</b>——它是两条标准化曲线的逐日均方根差，没有 0–100 的自然刻度。
+          后 3 / 6 / 12 月 = 窗口结束后 63 / 126 / 252 个交易日基准腿（篮子等权买入持有）的收益。这是条件化的历史统计——<b>不是预测</b>。
+        </div>
+      </div>
+    </div>
+  </div>
+</Base>

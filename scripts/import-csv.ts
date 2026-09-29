@@ -19,18 +19,24 @@ if (existsSync(priceDir)) {
     if (!f.endsWith(".csv")) continue;
     const ticker = f.replace(".csv", "").toUpperCase();
     const lines = readFileSync(`${priceDir}/${f}`, "utf8").split(/\r?\n/);
-    const head = (lines[0] ?? "").split(",").map((x) => x.trim().toLowerCase());
+    // 表头去 BOM：带 \ufeff 时 indexOf("date") 会失败，整只股票被静默跳过
+    const head = (lines[0] ?? "").replace(/^\ufeff/, "").split(",").map((x) => x.trim().toLowerCase());
     const di = head.indexOf("date");
     const ci = head.indexOf("close") >= 0 ? head.indexOf("close") : head.indexOf("value");
-    if (di < 0 || ci < 0) continue;
+    if (di < 0 || ci < 0) {
+      console.warn(`  ⚠ ${ticker}: 表头无 date/close 列（head=${head.join("|")}），整个文件未导入`);
+      continue;
+    }
     const vi = head.indexOf("volume");
     const rows: { date: string; close: number; volume: number | null }[] = [];
     for (let i = 1; i < lines.length; i++) {
       const c = lines[i]?.split(",");
       if (!c) continue;
-      const date = c[di];
-      const close = Number(c[ci]);
-      if (!date || !Number.isFinite(close)) continue;
+      const date = c[di]?.trim();
+      // Number("") === 0：空 close 会静默写成 0 价，必须排除
+      const raw = c[ci]?.trim();
+      const close = raw !== undefined && raw !== "" && raw !== "." ? Number(raw) : NaN;
+      if (!date || !Number.isFinite(close) || close <= 0) continue;
       const volRaw = vi >= 0 ? c[vi]?.trim() : undefined;
       const volume = volRaw !== undefined && volRaw !== "" ? Number(volRaw) : null;
       rows.push({ date, close, volume: volume !== null && Number.isFinite(volume) && volume > 0 ? volume : null });

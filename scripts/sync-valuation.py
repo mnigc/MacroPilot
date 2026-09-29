@@ -48,6 +48,9 @@ def main() -> int:
             t["date"] = pd.to_datetime(t["date"], errors="coerce")
             t["value"] = pd.to_numeric(t["value"], errors="coerce")
             t = t.dropna().sort_values("date")
+            # 页面顶部有一行"当日快照"（日期是抓取日，非月初）。剔除它保持纯月度语义：
+            # 否则同月出现两行、且每次同步该行日期都变，文件不可复现
+            t = t[t["date"].dt.day == 1]
             if len(t) < 240:
                 raise ValueError(f"only {len(t)} rows — page layout changed?")
             OUT.parent.mkdir(parents=True, exist_ok=True)

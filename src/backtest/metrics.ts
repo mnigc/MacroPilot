@@ -88,8 +88,8 @@ export function rollingSharpe(equity: { date: string; value: number }[], window 
     rets.push(cur.value / prev.value - 1);
     dates.push(cur.date);
   }
-  for (let i = window; i < rets.length; i++) {
-    const win = rets.slice(i - window, i + 1);
+  for (let i = window - 1; i < rets.length; i++) {
+    const win = rets.slice(i - window + 1, i + 1);
     const { mean, std } = meanStd(win);
     out.push({ date: dates[i] as string, value: std > 0 ? (mean / std) * Math.sqrt(252) : 0 });
   }
