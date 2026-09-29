@@ -7,3 +7,5 @@ data/backtest/
 web/dist/
 web/.astro/
 *.log
+__pycache__/
+data/tmp-*
