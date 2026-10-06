@@ -4,6 +4,8 @@ import {
   composeEquityTarget,
   latestVolMultiplier,
   latestValuationTilt,
+  latestSentimentTilt,
+  type SentimentConfig,
   type ValuationConfig,
   type VolTargetConfig,
 } from "../strategy/overlays.js";
@@ -28,12 +30,12 @@ import { depositToUsd } from "../account/config.js";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { parseFredCsv } from "../data/stats.js";
 import type { Point } from "../data/stats.js";
-import { loadCape } from "../backtest/context.js";
+import { loadCape, loadSentiment } from "../backtest/context.js";
 
 /**
- * 执行器：六个模块（定投/体制/波动率目标/估值锚/漂移/财报）→ 一张目标权重表 → 与当前组合求差额 → 交易。
+ * 执行器：七个模块（定投/体制/波动率目标/估值锚/情绪/漂移/财报）→ 一张目标权重表 → 与当前组合求差额 → 交易。
  *
- * 目标仓位三层合成与回测同口径：体制档位（含 Sahm 门）× 波动率乘数 × (1+估值偏移)，
+ * 目标仓位四层合成与回测同口径：体制档位（含 Sahm 门）× 波动率乘数 × (1+估值偏移) × (1+情绪偏移)，
  * 个股层再叠加财报缩放。纸面成交价 = 最近同步收盘价，成本逐笔计提（半价差+√冲击，按 ADV20；
  * 无成交量数据退回 slippagePercent），现金按 DGS3MO 日频计息。
  *
@@ -63,6 +65,7 @@ export interface ExecutorConfig {
   earnings: { enabled: boolean; riskOffDaysBefore: number; scaleFactor: number; restoreDaysAfter: number };
   volTarget: VolTargetConfig & { enabled: boolean };
   valuation: ValuationConfig & { enabled: boolean };
+  sentiment: SentimentConfig & { enabled: boolean };
   cost: { halfSpreadBps: number; impactCoef: number; earningsMult: number };
   cashInterest: boolean;
   /** 只算不写：跳过全部持久化，返回值里带完整预告 */
@@ -78,9 +81,9 @@ export interface ExecutionSummary {
   portfolioBefore: { cash: number; positions: Map<string, number> };
   equityBefore: number;
   targetWeights: Record<string, number>;
-  /** 三层合成的目标股票仓位（体制 × 波动率 × 估值） */
+  /** 三层合成的目标股票仓位（体制 × 波动率 × 估值 × 情绪） */
   composedEquityTarget: number;
-  composition: { regimeTarget: number; volMult: number | undefined; tilt: number | undefined };
+  composition: { regimeTarget: number; volMult: number | undefined; tilt: number | undefined; sentTilt: number | undefined };
   /** 本轮计提的现金利息（美元；未启用或无利率数据为 0） */
   cashInterestUsd: number;
   /** 本轮注入的现金（美元）：weekly 定投额或 deposits 部署的台账入金折算；未注入为 0 */
@@ -148,7 +151,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
   const regimeChanged = prevState !== null && prevState.equityTarget !== regimePoint.equityTarget;
   const retarget = prevState !== null && cfg.configSig !== undefined && (prevState.sig ?? null) !== cfg.configSig;
 
-  // 2) 叠加层：波动率目标乘数（近 22 日收盘）+ 估值锚偏移（CAPE 月度）
+  // 2) 叠加层：波动率目标乘数（近 22 日收盘）+ 估值锚偏移（CAPE 月度）+ 情绪偏移（新闻净宽度）
   let volMult: number | undefined;
   if (cfg.volTarget.enabled) {
     const since = new Date(Date.parse(asOf) - (cfg.volTarget.lookbackDays + 30) * 86_400_000).toISOString().slice(0, 10);
@@ -159,7 +162,8 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     volMult = latestVolMultiplier(arrays, cfg.volTarget);
   }
   const tilt = cfg.valuation.enabled ? latestValuationTilt(loadCape(), cfg.valuation) : undefined;
-  const composedEquityTarget = composeEquityTarget(regimePoint.equityTarget, volMult, tilt);
+  const sentTilt = cfg.sentiment.enabled ? latestSentimentTilt(loadSentiment(), cfg.sentiment) : undefined;
+  const composedEquityTarget = composeEquityTarget(regimePoint.equityTarget, volMult, tilt, sentTilt);
   if (regimePoint.gateActive) {
     // Sahm 门已在时间线内把 regime 目标压回 risk-off 档；这里只透传，不重复处理
   }
@@ -282,7 +286,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
       equityBefore: 0,
       targetWeights,
       composedEquityTarget,
-      composition: { regimeTarget: regimePoint.equityTarget, volMult, tilt },
+      composition: { regimeTarget: regimePoint.equityTarget, volMult, tilt, sentTilt },
       cashInterestUsd,
       injectionUsd,
       trades: [],
@@ -368,7 +372,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
     equityBefore,
     targetWeights,
     composedEquityTarget,
-    composition: { regimeTarget: regimePoint.equityTarget, volMult, tilt },
+    composition: { regimeTarget: regimePoint.equityTarget, volMult, tilt, sentTilt },
     cashInterestUsd,
     injectionUsd,
     trades,
@@ -415,6 +419,7 @@ export async function runOnce(cfg: ExecutorConfig): Promise<ExecutionSummary> {
         regimeTarget: rp.equityTarget,
         volMult: volMult ?? null,
         tilt: tilt ?? null,
+        sentTilt: sentTilt ?? null,
         final: Math.round(composedEquityTarget * 10000) / 10000,
       },
       equity: Math.round(eq * 100) / 100,

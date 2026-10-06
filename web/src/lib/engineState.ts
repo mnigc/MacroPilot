@@ -1,6 +1,6 @@
 /**
  * 仪表盘与策略引擎页共用的状态计算。
- * 六引擎读数、体制边缘、财报窗口、持仓偏离都在这里现算、两个页面各取所需，
+ * 七引擎读数、体制边缘、财报窗口、持仓偏离都在这里现算、两个页面各取所需，
  * 避免"同源数据两处算"将来跑出两套口径。全部是实测读数，没有一项是估算。
  */
 import { existsSync, readFileSync } from "node:fs";
@@ -23,12 +23,32 @@ export const fmtPct = (v: number, d = 1) => `${(v * 100).toFixed(d)}%`;
 /** 状态行里的数字加粗：string 是说明文字，{b} 是读数 */
 export type Tok = string | { b: string; cls?: string };
 
+export interface NewsItem {
+  ts: string | null;
+  source: string;
+  text: string;
+  signal: "long" | "short" | "neutral";
+  score: number | null;
+  link: string;
+}
+
+/** sync-news.py 落的 latest.json：最近一批高影响新闻（首页情绪流展示用） */
+export interface NewsFeed {
+  fetchedAt: string;
+  value: number | null;
+  long: number;
+  short: number;
+  rated: number;
+  items: NewsItem[];
+}
+
 export async function getEngineState() {
   const cfg = JSON.parse(readFileSync("../config/strategy.json", "utf8")) as {
     engines: {
       dca: { amountUsdt: number };
       regime: { scoreHigh: number; scoreLow: number; scoreRelease: number; allocation: Record<string, number>; gate?: { sahmThreshold: number }; signals: Record<string, { weight: number }> };
       volTarget?: { targetVol: number };
+      sentiment?: { maxTilt: number; lookbackDays: number; minObs: number };
       drift: { thresholdPp: number };
       earnings: { riskOffDaysBefore: number; scaleFactor: number; restoreDaysAfter: number };
     };
@@ -54,6 +74,31 @@ export async function getEngineState() {
   ]);
   /** 估值锚引擎的数据源是否在位（sync-valuation.py 的产物） */
   const capeReady = existsSync("../data/valuation/cape.csv");
+
+  /** 情绪引擎的数据源（sync-news.py 的产物）：最新读数与累计天数（历史无法回填，逐日积累） */
+  let sentLast: { date: string; value: number } | null = null;
+  let sentObs = 0;
+  const sentPath = "../data/news/sentiment.csv";
+  if (existsSync(sentPath)) {
+    const lines = readFileSync(sentPath, "utf8").trim().split(/\r?\n/).filter(Boolean);
+    sentObs = Math.max(0, lines.length - 1);
+    const last = lines.at(-1)?.split(",");
+    const value = last ? Number(last[1]) : NaN;
+    if (last?.[0] && Number.isFinite(value)) sentLast = { date: last[0], value };
+  }
+  const sentMinObs = cfg.engines.sentiment?.minObs ?? 40;
+
+  /** 新闻情绪流数据（缺失/半截 JSON 都按未同步处理，不让首页炸） */
+  let news: NewsFeed | null = null;
+  const newsJsonPath = "../data/news/latest.json";
+  if (existsSync(newsJsonPath)) {
+    try {
+      news = JSON.parse(readFileSync(newsJsonPath, "utf8")) as NewsFeed;
+      if (!Array.isArray(news.items)) news = null;
+    } catch {
+      news = null;
+    }
+  }
 
   const px = Object.fromEntries(board.map((b) => [b.ticker, b]));
   const cash = portfolio.find((p) => p.ticker === "CASH")?.units ?? 0;
@@ -121,6 +166,7 @@ export async function getEngineState() {
 
   const volMultNow = preview?.composition.volMult ?? null;
   const tiltNow = preview?.composition.tilt ?? null;
+  const sentNow = preview?.composition.sentTilt ?? null;
 
   return {
     cfg,
@@ -158,5 +204,10 @@ export async function getEngineState() {
     switches90,
     volMultNow,
     tiltNow,
+    sentLast,
+    sentObs,
+    sentMinObs,
+    sentNow,
+    news,
   };
 }

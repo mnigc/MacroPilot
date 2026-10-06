@@ -2,7 +2,7 @@
  * 回测 CLI：npm run backtest
  *
  * 一轮完整产出：
- *  1. 消融实验：同一数据、同一现金流，按引擎开关跑 5 个配置（dca → +regime → +vol → +value → full），
+ *  1. 消融实验：同一数据、同一现金流，按引擎开关跑 6 个配置（dca → +regime → +vol → +value → +sent → full），
  *     每个配置一条 backtest_runs（variant 标签）——"每个引擎值不值得存在"由数据回答。
  *  2. full 配置附带全部统计产物落 run_artifacts：月度收益矩阵、滚动夏普、自助法置信区间、
  *     蒙特卡洛前景扇形、宏观类比窗口。
@@ -10,7 +10,7 @@
  */
 import "dotenv/config";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { loadStrategyFile, loadBacktestContext, regimeConfigOf, volTargetConfigOf, valuationConfigOf } from "../src/backtest/context.js";
+import { loadStrategyFile, loadBacktestContext, regimeConfigOf, volTargetConfigOf, valuationConfigOf, sentimentConfigOf } from "../src/backtest/context.js";
 import { runBacktest, type BacktestConfig, type EngineToggles } from "../src/backtest/engine.js";
 import { computeMetrics, monthlyReturns, rollingSharpe, type BacktestMetrics } from "../src/backtest/metrics.js";
 import { sharpeDrawdownCI, monteCarloFan, analogWindows, dailyReturns } from "../src/backtest/resample.js";
@@ -41,8 +41,10 @@ console.log("  体制分布:", regimeCount);
 
 const volCfg = volTargetConfigOf(s);
 const valCfg = valuationConfigOf(s);
+const sentCfg = sentimentConfigOf(s);
 const volMultOn = volCfg.enabled && ctx.volMult.some((v) => v !== undefined);
 const tiltOn = valCfg.enabled && ctx.tilt.some((v) => v !== undefined);
+const sentOn = sentCfg.enabled && ctx.sentTilt.some((v) => v !== undefined);
 console.log(
   `  叠加层: 波动率目标 ${volMultOn ? `开（目标 ${(volCfg.targetVol * 100).toFixed(0)}%，最新乘数 ${(ctx.volMult.at(-1) ?? 1)?.toFixed(2)}）` : "关"} · 估值锚 ${tiltOn ? `开（CAPE ${ctx.cape.at(-1)?.value.toFixed(1)}，最新偏移 ${((ctx.tilt.at(-1) ?? 0) * 100).toFixed(1)}%）` : "关"}`,
 );
@@ -55,6 +57,7 @@ const engines = (over: Partial<EngineToggles>): EngineToggles => ({
   regime: false,
   volTarget: false,
   valuation: false,
+  sentiment: false,
   drift: false,
   earnings: false,
   ...over,
@@ -66,7 +69,8 @@ const VARIANTS: { label: string; engines: EngineToggles }[] = [
   { label: "+regime", engines: engines({ regime: true }) },
   { label: "+vol", engines: engines({ regime: true, volTarget: true }) },
   { label: "+value", engines: engines({ regime: true, volTarget: true, valuation: true }) },
-  { label: "full", engines: engines({ regime: true, volTarget: true, valuation: true, drift: true, earnings: true }) },
+  { label: "+sent", engines: engines({ regime: true, volTarget: true, valuation: true, sentiment: true }) },
+  { label: "full", engines: engines({ regime: true, volTarget: true, valuation: true, sentiment: true, drift: true, earnings: true }) },
 ];
 
 const batchId = new Date().toISOString().slice(0, 16);
@@ -93,6 +97,7 @@ const baseCfg: Omit<BacktestConfig, "engines"> = {
   cost: { ...cost, flatBps: s.execution.slippagePercent * 100 },
   volTriggerPp: volCfg.triggerPp,
   valueTriggerPp: valCfg.triggerPp,
+  sentTriggerPp: sentCfg.triggerPp,
   earnings: {
     daysBefore: s.engines.earnings.riskOffDaysBefore,
     daysAfter: s.engines.earnings.restoreDaysAfter,
@@ -104,7 +109,7 @@ const baseCfg: Omit<BacktestConfig, "engines"> = {
 };
 
 for (const variant of VARIANTS) {
-  const result = runBacktest(ctx.closes, timeline, { ...baseCfg, engines: variant.engines, volMult: ctx.volMult, tilt: ctx.tilt });
+  const result = runBacktest(ctx.closes, timeline, { ...baseCfg, engines: variant.engines, volMult: ctx.volMult, tilt: ctx.tilt, sentTilt: ctx.sentTilt });
   const metrics = computeMetrics(result.strategyEquity);
   const bench = computeMetrics(result.benchmarkEquity);
   const b40 = computeMetrics(result.benchmark6040Equity);
@@ -135,6 +140,7 @@ for (const variant of VARIANTS) {
       cost: baseCfg.cost,
       volTarget: volMultOn ? volCfg : null,
       valuation: tiltOn ? valCfg : null,
+      sentiment: sentOn ? sentCfg : null,
       cashInterest: !!cashRate,
       earningsWindow: baseCfg.earnings,
     },
@@ -161,7 +167,7 @@ console.log(`\n消融批 ${batchId} 已入库（${rows.length} 条 run）`);
 
 // ---- full 配置的统计产物 ----
 if (fullRunId !== null) {
-  const fullResult = runBacktest(ctx.closes, timeline, { ...baseCfg, engines: VARIANTS.at(-1)!.engines, volMult: ctx.volMult, tilt: ctx.tilt });
+  const fullResult = runBacktest(ctx.closes, timeline, { ...baseCfg, engines: VARIANTS.at(-1)!.engines, volMult: ctx.volMult, tilt: ctx.tilt, sentTilt: ctx.sentTilt });
   const stratRets = dailyReturns(fullResult.strategyEquity).rets;
   const benchRets = dailyReturns(fullResult.benchmarkEquity).rets;
   const ciStrat = sharpeDrawdownCI(stratRets);

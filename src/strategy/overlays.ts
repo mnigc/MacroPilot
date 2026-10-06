@@ -7,6 +7,7 @@ import { alignToCalendar, percentileRank } from "../data/stats.js";
  *
  *   波动率目标  realizedVol → multiplier：波动升高自动减仓，回落自动恢复（不杠杆，ceiling ≤ 1）
  *   估值锚      CAPE 滚动百分位 → ±maxTilt 的线性偏移：贵时少买，便宜时多买
+ *   新闻情绪    净宽度滚动百分位 → ±maxTilt 的线性偏移：恐慌时多买，亢奋时少买（与估值锚同构）
  */
 
 export interface VolTargetConfig {
@@ -24,6 +25,15 @@ export interface ValuationConfig {
   maxTilt: number;
   /** CAPE 百分位的滚动回看年数 */
   lookbackYears: number;
+}
+
+export interface SentimentConfig {
+  /** 最大偏移幅度（0.1 = ±10% 权益仓位） */
+  maxTilt: number;
+  /** 净宽度百分位的滚动回看交易日数 */
+  lookbackDays: number;
+  /** 窗口内至少要有这么多有效读数才出偏移——历史无法回填，序列攒够前引擎按关闭处理 */
+  minObs: number;
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -125,9 +135,50 @@ export function valuationTiltSeries(
   return out;
 }
 
-/** 组合后的目标权益仓位：体制档位 × 波动率乘数 × (1 + 估值偏移)，夹在 [0,1] */
-export function composeEquityTarget(regimeTarget: number, volMult: number | undefined, tilt: number | undefined): number {
-  return clamp(regimeTarget * (volMult ?? 1) * (1 + (tilt ?? 0)), 0, 1);
+/**
+ * 情绪偏移序列：新闻净宽度读数（0~100，50=中性）对每个交易日取"截至当日的最新读数"，
+ * 在滚动 lookbackDays 交易日窗口里算百分位；偏移 = (0.5 − 百分位) × 2 × maxTilt，
+ * 与估值锚同构的逆向公式——恐慌（百分位低）加仓，亢奋（百分位高）减仓。
+ * 窗口内有效读数不足 minObs 时返回 undefined：历史无法回填，启用初期整个序列都是
+ * undefined，引擎自然处于关闭态，攒够数据才逐步生效。
+ */
+export function sentimentTiltSeries(
+  readings: Point[],
+  calendar: string[],
+  cfg: SentimentConfig,
+): (number | undefined)[] {
+  if (!readings.length) return calendar.map(() => undefined);
+  const aligned = alignToCalendar(readings, calendar);
+  const out: (number | undefined)[] = [];
+  for (let i = 0; i < calendar.length; i++) {
+    const v = aligned[i];
+    if (v === undefined) {
+      out.push(undefined);
+      continue;
+    }
+    const hist: number[] = [];
+    for (let j = i; j >= 0 && hist.length < cfg.lookbackDays; j--) {
+      const h = aligned[j];
+      if (h !== undefined) hist.push(h);
+    }
+    if (hist.length < cfg.minObs) {
+      out.push(undefined);
+      continue;
+    }
+    const pctile = percentileRank(hist, v);
+    out.push(clamp((0.5 - pctile) * 2, -1, 1) * cfg.maxTilt);
+  }
+  return out;
+}
+
+/** 组合后的目标权益仓位：体制档位 × 波动率乘数 × (1 + 估值偏移) × (1 + 情绪偏移)，夹在 [0,1] */
+export function composeEquityTarget(
+  regimeTarget: number,
+  volMult: number | undefined,
+  tilt: number | undefined,
+  sentTilt?: number | undefined,
+): number {
+  return clamp(regimeTarget * (volMult ?? 1) * (1 + (tilt ?? 0)) * (1 + (sentTilt ?? 0)), 0, 1);
 }
 
 /* ---------- 执行器用的"只算最新一天"版本 ---------- */
@@ -175,5 +226,14 @@ export function latestValuationTilt(cape: Point[], cfg: ValuationConfig): number
   if (!cape.length) return undefined;
   const hist = cape.slice(-cfg.lookbackYears * 12);
   const pctile = percentileRank(hist.map((p) => p.value), hist.at(-1)?.value ?? 0);
+  return clamp((0.5 - pctile) * 2, -1, 1) * cfg.maxTilt;
+}
+
+/** 最新情绪偏移：最近 lookbackDays 个读数；不足 minObs 返回 undefined（攒数据期） */
+export function latestSentimentTilt(readings: Point[], cfg: SentimentConfig): number | undefined {
+  if (!readings.length) return undefined;
+  const hist = readings.slice(-cfg.lookbackDays).map((p) => p.value);
+  if (hist.length < cfg.minObs) return undefined;
+  const pctile = percentileRank(hist, hist.at(-1) ?? 0);
   return clamp((0.5 - pctile) * 2, -1, 1) * cfg.maxTilt;
 }

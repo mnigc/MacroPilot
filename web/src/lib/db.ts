@@ -357,7 +357,7 @@ export interface ExecutorPreview {
   score: number;
   sahm: number | null;
   gateActive: boolean;
-  composition: { regimeTarget: number; volMult: number | null; tilt: number | null; final: number };
+  composition: { regimeTarget: number; volMult: number | null; tilt: number | null; sentTilt: number | null; final: number };
   equity: number;
   drifts: { ticker: string; driftPp: number; thresholdPp: number }[];
   nextFriday: { date: string; injectionUsdt: number; planned: { ticker: string; usdt: number }[] } | null;

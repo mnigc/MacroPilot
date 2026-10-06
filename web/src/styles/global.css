@@ -212,6 +212,33 @@ button.chip:hover { background: rgba(255, 255, 255, 0.09); color: var(--text); }
 .pill.regime { background: var(--yellow-dim); color: var(--yellow); }
 .pill.drift { background: var(--purple-dim); color: var(--purple); }
 .pill.earnings { background: var(--warn-dim); color: var(--warn); }
+.pill.nb-long { background: var(--up-dim); color: var(--up); }
+.pill.nb-short { background: var(--down-dim); color: var(--down); }
+.pill.nb-mid { background: rgba(132, 142, 156, 0.16); color: var(--text-3); }
+
+/* ---------- 新闻情绪流（首页，与下一轮预告并排 · 纵向滚动）----------
+   nf-wrap 撑满面板剩余高度，vfeed 绝对定位其中（高度由并排的下一轮预告面板决定）；
+   轨道里两份相同条目序列，动画位移 -50% 即无缝循环；不满一屏不滚。 */
+.nf-wrap { position: relative; min-height: 220px; }
+.vfeed {
+  position: absolute; inset: 0; overflow: hidden; scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 16px, #000 calc(100% - 16px), transparent);
+  mask-image: linear-gradient(180deg, transparent, #000 16px, #000 calc(100% - 16px), transparent);
+}
+.vfeed-track { display: flex; flex-direction: column; }
+.vfeed[data-vfeed="on"] .vfeed-track { animation: vfeed-run var(--vfeed-dur, 45s) linear infinite; }
+.vfeed[data-vfeed="on"]:hover .vfeed-track { animation-play-state: paused; }
+@keyframes vfeed-run { to { transform: translateY(-50%); } }
+.nf-item { display: block; padding: 10px 16px 11px; border-bottom: 1px solid var(--line); text-decoration: none; transition: background 0.14s; }
+.nf-item:hover { background: rgba(255, 255, 255, 0.035); }
+.nf-meta { display: flex; align-items: center; gap: 8px; }
+.nf-meta .src { font-size: 11px; font-weight: 700; letter-spacing: 0.3px; color: var(--text-3); }
+.nf-meta .tm { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text-4); }
+.nf-txt {
+  margin-top: 5px; font-size: 12.5px; color: var(--text-2); line-height: 1.55;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.nf-item:hover .nf-txt { color: var(--text); }
 
 /* ---------- 表格 ---------- */
 .tbl { width: 100%; border-collapse: collapse; }
@@ -358,6 +385,7 @@ button.chip:hover { background: rgba(255, 255, 255, 0.09); color: var(--text); }
   .g-3, .g-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .g-5 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .g-21, .g-32 { grid-template-columns: 1fr; }
+  .nf-wrap { height: 460px; }
 }
 @media (max-width: 900px) {
   .app { grid-template-columns: 1fr; }

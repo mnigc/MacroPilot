@@ -1,4 +1,4 @@
-export type Driver = "seed" | "dca" | "regime" | "volTarget" | "valuation" | "retarget" | "drift" | "earnings";
+export type Driver = "seed" | "dca" | "regime" | "volTarget" | "valuation" | "sentiment" | "retarget" | "drift" | "earnings";
 
 /**
  * trades.reason 存的是全部触发引擎（逗号分隔）——一笔周五恰逢体制切换的调仓
@@ -10,12 +10,13 @@ export const DRIVER_LABEL: Record<Driver, string> = {
   regime: "体制",
   volTarget: "波动率",
   valuation: "估值",
+  sentiment: "情绪",
   retarget: "调参",
   drift: "漂移",
   earnings: "财报",
 };
 
-const ALL: string[] = ["seed", "dca", "regime", "volTarget", "valuation", "retarget", "drift", "earnings"];
+const ALL: string[] = ["seed", "dca", "regime", "volTarget", "valuation", "sentiment", "retarget", "drift", "earnings"];
 
 export function parseDrivers(reason: string): Driver[] {
   return reason

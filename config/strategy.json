@@ -1,5 +1,5 @@
 {
-  "$comment": "策略参数：六个策略模块（定投/体制/波动率目标/估值锚/漂移/财报）共享一个纸面执行器，输出合成一张目标权重表。所有可调参数集中在此。",
+  "$comment": "策略参数：七个策略模块（定投/体制/波动率目标/估值锚/情绪/漂移/财报）共享一个纸面执行器，输出合成一张目标权重表。所有可调参数集中在此。",
   "basket": {
     "$comment": "目标篮子：当前为等权 Mag7。改这份 ticker 列表即可换标的组合（数据由 scripts/sync-prices.py 从 yfinance 同步）",
     "tickers": [
@@ -75,6 +75,14 @@
       "enabled": true,
       "maxTilt": 0.1,
       "lookbackYears": 20,
+      "triggerPp": 5
+    },
+    "sentiment": {
+      "$comment": "情绪叠加：新闻净宽度（AI 标注 long/short 的日读数，50=中性）滚动百分位 → ±maxTilt 线性偏移（恐慌时多买，亢奋时少买），与估值锚同构的逆向公式。日读数由 scripts/sync-news.py 抓 OpenNews（engineTypes=news + score≥60 双过滤）存 data/news/sentiment.csv。历史无法回填，minObs 守卫：读数攒够前偏移按关闭处理，两三个月后再用回测验证逆向假设是否有正贡献",
+      "enabled": true,
+      "maxTilt": 0.1,
+      "lookbackDays": 120,
+      "minObs": 40,
       "triggerPp": 5
     },
     "drift": {

@@ -24,9 +24,10 @@ const base: BacktestConfig = {
   driftThresholdPp: 5,
   minTradeUsdt: 20,
   cost: { halfSpreadBps: 3, impactCoef: 0.35, flatBps: 15, earningsMult: 1.5 },
-  engines: { dca: true, regime: true, volTarget: false, valuation: false, drift: true, earnings: false },
+  engines: { dca: true, regime: true, volTarget: false, valuation: false, sentiment: false, drift: true, earnings: false },
   volTriggerPp: 10,
   valueTriggerPp: 5,
+  sentTriggerPp: 5,
   earnings: { daysBefore: 2, daysAfter: 1, scale: 0.5 },
   earningsByTicker: new Map(),
 };
@@ -136,5 +137,31 @@ describe("回测引擎", () => {
       volMult,
     });
     expect(withVol.targetSeries[0]!.value).toBeCloseTo(0.5, 10);
+  });
+
+  it("情绪偏移跳变超过阈值 → 触发调仓并记 sentiment 驱动", () => {
+    const dates = days("2024-01-01", 10);
+    // 中性档 0.6：偏移 0 → 目标 0.6；第 6 天起恐慌极态 +0.2 → 目标 0.72，必有真实调仓
+    const sentTilt = dates.map((_, i) => (i < 5 ? 0 : 0.2) as number | undefined);
+    const result = runBacktest(flatPrices(dates, base.tickers, 100), timelineOf(dates, 0.6, "neutral"), {
+      ...base,
+      engines: { ...base.engines, sentiment: true },
+      sentTilt,
+    });
+    expect(result.targetSeries[5]!.value).toBeCloseTo(0.72, 10);
+    const sentTrades = result.trades.filter((t) => t.date >= dates[5]! && t.drivers.includes("sentiment"));
+    expect(sentTrades.length).toBeGreaterThan(0);
+    // 首日建仓不该提前记 sentiment（彼时偏移还没动过）
+    expect(result.trades[0]!.drivers).not.toContain("sentiment");
+  });
+
+  it("sentiment 关闭时同样的偏移序列不影响目标", () => {
+    const dates = days("2024-01-01", 10);
+    const sentTilt = dates.map((_, i) => (i < 5 ? 0 : 0.2) as number | undefined);
+    const result = runBacktest(flatPrices(dates, base.tickers, 100), timelineOf(dates, 0.6, "neutral"), {
+      ...base,
+      sentTilt,
+    });
+    for (const p of result.targetSeries) expect(p.value).toBeCloseTo(0.6, 10);
   });
 });

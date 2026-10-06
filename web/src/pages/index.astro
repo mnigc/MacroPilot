@@ -10,7 +10,7 @@ import { getMacroReadings, getExecutorRun } from "../lib/db";
 const {
   e, run, regimePoints, latest, cover, nextEarn, earnWindow, inWindow, paperTrades, preview,
   nextEarnLabel, nextFriday, dcaCount, score, regime, edge,
-  equity, startCash, pnl, cash, cashWeight, cashTarget, targetEach, rows, missingPx,
+  equity, startCash, pnl, cash, cashWeight, cashTarget, targetEach, rows, missingPx, news,
 } = await getEngineState();
 const bands = regimeBands(regimePoints.map((p) => p.date), regimePoints.map((p) => p.regime));
 
@@ -32,7 +32,7 @@ const execAgeH = executor ? (Date.now() - Date.parse(executor.at)) / 3_600_000 :
 const execChip = execAgeH === null ? "" : execAgeH <= 30 ? "ok" : execAgeH <= 54 ? "warn" : "bad";
 const execAgeLabel = execAgeH === null ? "未运行" : execAgeH < 1 ? `${Math.round(execAgeH * 60)} 分钟前` : execAgeH < 48 ? `${execAgeH.toFixed(0)} 小时前` : `${(execAgeH / 24).toFixed(1)} 天前`;
 ---
-<Base active="dash" crumb="投顾仪表盘" sub="六模块 → 一张目标权重表 → 一个纸面执行器">
+<Base active="dash" crumb="投顾仪表盘" sub="七模块 → 一张目标权重表 → 一个纸面执行器">
   <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
     <span class:list={["badge", regime]}><span class="dot"></span>{REGIME_LABEL[regime]} · {score.toFixed(3)}</span>
     <span class="chip">纸面账户</span>
@@ -148,48 +148,96 @@ const execAgeLabel = execAgeH === null ? "未运行" : execAgeH < 1 ? `${Math.ro
     </div>
   </div>
 
-  <div class="panel" style="margin-top:12px">
-    <div class="panel-hd">
-      <h2>下一轮预告</h2><span class="hint">规则确定性 → 下轮动作可提前算出（npm run agent --dry-run 同源）</span>
-      <div class="right">{preview && <span class="faint">截至 {preview.asOf}</span>}</div>
+  <div class="grid g-32" style="margin-top:12px">
+    <div class="panel">
+      <div class="panel-hd">
+        <h2>下一轮预告</h2><span class="hint">规则确定性 → 下轮动作可提前算出（npm run agent --dry-run 同源）</span>
+        <div class="right">{preview && <span class="faint">截至 {preview.asOf}</span>}</div>
+      </div>
+      <div class="panel-bd">
+        {preview ? (
+          <>
+            <div class="tiles" style="grid-template-columns:repeat(3,1fr)">
+              <div class="tile">
+                <div class="tile-k">目标仓位合成</div>
+                <div class="tile-v sm">{((preview.composition.final ?? 0) * 100).toFixed(0)}%</div>
+                <div class="tile-s">体制 {(preview.composition.regimeTarget * 100).toFixed(0)}% × 波动率 {preview.composition.volMult !== null ? `×${preview.composition.volMult.toFixed(2)}` : "×—"}{preview.composition.tilt !== null ? ` × (1${preview.composition.tilt >= 0 ? "+" : ""}${(preview.composition.tilt * 100).toFixed(1)}%)` : ""}{preview.composition.sentTilt != null ? ` × (1${preview.composition.sentTilt >= 0 ? "+" : ""}${(preview.composition.sentTilt * 100).toFixed(1)}%)` : ""}</div>
+              </div>
+              <div class="tile">
+                <div class="tile-k">下轮定投 {preview.nextFriday?.date ?? "—"}</div>
+                <div class="tile-v sm">${preview.nextFriday?.injectionUsdt ?? 0}</div>
+                <div class="tile-s">{preview.nextFriday?.planned.map((p) => `${p.ticker} $${p.usdt}`).join(" · ") || "—"}</div>
+              </div>
+              <div class="tile">
+                <div class="tile-k">未来 14 天财报</div>
+                <div class="tile-v sm">{preview.earningsNext14d.length || "0"} 场</div>
+                <div class="tile-s">{preview.earningsNext14d.map((x) => `${x.ticker} ${x.date}`).join(" · ") || "窗口外，无避险动作"}</div>
+              </div>
+            </div>
+            <div class="sep"></div>
+            <div class="faint" style="margin-bottom:6px">漂移读数（±{e.drift.thresholdPp}pp 触发拉回；>60% 阈值预标黄）</div>
+            {preview.drifts.map((d) => {
+              const hot = Math.abs(d.driftPp) > d.thresholdPp;
+              const warm = !hot && Math.abs(d.driftPp) > d.thresholdPp * 0.6;
+              return (
+                <div class="sig" style="grid-template-columns:64px 1fr 90px">
+                  <div class="n">{d.ticker}</div>
+                  <div class="bar"><i style={`width:${Math.min(100, (Math.abs(d.driftPp) / (d.thresholdPp * 1.5)) * 100)}%;background:var(--${hot ? "down" : warm ? "yellow" : "blue"})`}></i></div>
+                  <div class="v" style={`color:var(--${hot ? "down" : warm ? "yellow" : "text-3"})`}>{d.driftPp >= 0 ? "+" : ""}{d.driftPp.toFixed(2)}pp</div>
+                </div>
+              );
+            })}
+          </>
+        ) : (
+          <div class="empty">还没有执行预告 —— 跑一轮 <code>npm run agent</code> 后生成</div>
+        )}
+      </div>
     </div>
-    <div class="panel-bd">
-      {preview ? (
-        <>
-          <div class="tiles" style="grid-template-columns:repeat(3,1fr)">
-            <div class="tile">
-              <div class="tile-k">目标仓位合成</div>
-              <div class="tile-v sm">{((preview.composition.final ?? 0) * 100).toFixed(0)}%</div>
-              <div class="tile-s">体制 {(preview.composition.regimeTarget * 100).toFixed(0)}% × 波动率 {preview.composition.volMult !== null ? `×${preview.composition.volMult.toFixed(2)}` : "×—"}{preview.composition.tilt !== null ? ` × (1${preview.composition.tilt >= 0 ? "+" : ""}${(preview.composition.tilt * 100).toFixed(1)}%)` : ""}</div>
-            </div>
-            <div class="tile">
-              <div class="tile-k">下轮定投 {preview.nextFriday?.date ?? "—"}</div>
-              <div class="tile-v sm">${preview.nextFriday?.injectionUsdt ?? 0}</div>
-              <div class="tile-s">{preview.nextFriday?.planned.map((p) => `${p.ticker} $${p.usdt}`).join(" · ") || "—"}</div>
-            </div>
-            <div class="tile">
-              <div class="tile-k">未来 14 天财报</div>
-              <div class="tile-v sm">{preview.earningsNext14d.length || "0"} 场</div>
-              <div class="tile-s">{preview.earningsNext14d.map((x) => `${x.ticker} ${x.date}`).join(" · ") || "窗口外，无避险动作"}</div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <h2>新闻情绪流</h2><span class="hint">AI 逐条标注多空 → 净宽度进情绪引擎</span>
+      </div>
+      <div class="panel-bd flush grow nf-wrap">
+        {news && news.items.length > 0 ? (
+          <div class="vfeed" data-vfeed="off">
+            <div class="vfeed-track">
+              {[[0, false], [1, true]].map(([pass, hidden]) => (
+                <div class="vfeed-seq" aria-hidden={hidden ? "true" : undefined}>
+                  {news!.items.map((n) => {
+                    // 无链接条目（Reuters/jin10 等通讯社快讯上游不挂 URL）渲染成普通块，不做可点假象
+                    const body = (
+                      <>
+                        <div class="nf-meta">
+                          <span class:list={["pill", n.signal === "long" ? "nb-long" : n.signal === "short" ? "nb-short" : "nb-mid"]}>
+                            {n.signal === "long" ? "▲ 多" : n.signal === "short" ? "▼ 空" : "— 中"}
+                          </span>
+                          <span class="src">{n.source || "—"}</span>
+                          <span class="tm">{n.ts ? n.ts.slice(5, 16).replace("T", " ") : ""}</span>
+                        </div>
+                        <div class="nf-txt">{n.text}</div>
+                      </>
+                    );
+                    return n.link ? (
+                      <a class="nf-item" href={n.link} target="_blank" rel="noopener noreferrer">{body}</a>
+                    ) : (
+                      <div class="nf-item">{body}</div>
+                    );
+                  })}
+                </div>
+              ))}
             </div>
           </div>
-          <div class="sep"></div>
-          <div class="faint" style="margin-bottom:6px">漂移读数（±{e.drift.thresholdPp}pp 触发拉回；>60% 阈值预标黄）</div>
-          {preview.drifts.map((d) => {
-            const hot = Math.abs(d.driftPp) > d.thresholdPp;
-            const warm = !hot && Math.abs(d.driftPp) > d.thresholdPp * 0.6;
-            return (
-              <div class="sig" style="grid-template-columns:64px 1fr 90px">
-                <div class="n">{d.ticker}</div>
-                <div class="bar"><i style={`width:${Math.min(100, (Math.abs(d.driftPp) / (d.thresholdPp * 1.5)) * 100)}%;background:var(--${hot ? "down" : warm ? "yellow" : "blue"})`}></i></div>
-                <div class="v" style={`color:var(--${hot ? "down" : warm ? "yellow" : "text-3"})`}>{d.driftPp >= 0 ? "+" : ""}{d.driftPp.toFixed(2)}pp</div>
-              </div>
-            );
-          })}
-        </>
-      ) : (
-        <div class="empty">还没有执行预告 —— 跑一轮 <code>npm run agent</code> 后生成</div>
-      )}
+        ) : (
+          <div class="empty">新闻流未同步 —— 运行 <code>python scripts/sync-news.py</code>（需 OPENNEWS_TOKEN）或由 sync-data workflow 同步</div>
+        )}
+      </div>
+      <div class="panel-bd" style="padding-top:0">
+        <div class="faint" style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
+          <span>{news?.value != null ? <>读数 {news.value.toFixed(0)}（50=中性）· 多 {news.long}/空 {news.short}</> : "读数待积累"}</span>
+          {news && <span>截至 {news.fetchedAt.slice(5, 16).replace("T", " ")}Z</span>}
+        </div>
+      </div>
     </div>
   </div>
 
@@ -268,4 +316,19 @@ const execAgeLabel = execAgeH === null ? "未运行" : execAgeH < 1 ? `${Math.ro
       </table>
     </div>
   </div>
+
+  <script>
+    /**
+     * 新闻情绪流纵向滚动：轨道里两份相同条目序列，动画位移 -50% 即无缝循环。
+     * 条目不足一屏时保持静态列表；时长按序列高度换算（约 26px/s），悬停暂停。
+     */
+    for (const feed of document.querySelectorAll<HTMLElement>(".vfeed[data-vfeed]")) {
+      const seq = feed.querySelector<HTMLElement>(".vfeed-seq");
+      if (!seq) continue;
+      if (seq.offsetHeight <= feed.clientHeight) continue;
+      if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) continue;
+      feed.style.setProperty("--vfeed-dur", `${Math.max(24, seq.offsetHeight / 26).toFixed(1)}s`);
+      feed.dataset.vfeed = "on";
+    }
+  </script>
 </Base>

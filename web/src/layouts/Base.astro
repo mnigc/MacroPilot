@@ -134,7 +134,7 @@ const execLabel = !fresh.agent.at
         <main class="content">
           <slot />
           <div class="foot">
-            <span>MacroPilot — 定投 · 体制 · 漂移 · 财报，四引擎共享一个纸面执行器 · 回测 run #{run?.id ?? "—"}</span>
+            <span>MacroPilot — 定投 · 体制 · 波动率 · 估值 · 情绪 · 漂移 · 财报，七引擎共享一个纸面执行器 · 回测 run #{run?.id ?? "—"}</span>
             <span>纸面数据，不构成投资建议 · <a href="https://github.com/mnigc/macro-bnbchain" class="dim" style="text-decoration:underline">GitHub</a></span>
           </div>
         </main>
@@ -144,10 +144,11 @@ const execLabel = !fresh.agent.at
       /**
        * 行情条 marquee：单轮宽度不足视口时右侧会露白，所以先把条目补齐到 ≥1.5 轮，
        * 再按固定像素速度换算动画时长——两条 track 各位移自身宽度的 100% 即无缝循环。
+       * 页面上可以有多个 strip（顶栏行情条 + 首页新闻情绪流），逐个处理。
        */
-      const strip = document.querySelector<HTMLElement>(".strip[data-marquee]");
-      const tracks = strip ? Array.from(strip.querySelectorAll<HTMLElement>(".strip-track")) : [];
-      if (strip && tracks.length === 2) {
+      for (const strip of document.querySelectorAll<HTMLElement>(".strip[data-marquee]")) {
+        const tracks = Array.from(strip.querySelectorAll<HTMLElement>(".strip-track"));
+        if (tracks.length !== 2) continue;
         const [head, tail] = tracks;
         const proto = Array.from(head.children) as HTMLElement[];
         const addOnce = () => {

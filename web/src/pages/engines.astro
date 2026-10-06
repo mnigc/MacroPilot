@@ -4,13 +4,13 @@ import { REGIME_LABEL } from "../lib/bands";
 import { getEngineState, fmtUsd, fmtPct, type Tok } from "../lib/engineState";
 
 /**
- * 策略引擎页：六模块各自读到什么、规则是什么、离动作多远，加上财报排程与历史类比。
+ * 策略引擎页：七模块各自读到什么、规则是什么、离动作多远，加上财报排程与历史类比。
  * 账户状态在仪表盘，统计验证在回测实验室——这里只回答"引擎们现在怎么样"。
  */
 const {
   e, run, latest, cover, nextEarn, inWindow, analog,
   regime, score, edge, switches90, nextFriday, dcaCount,
-  volMultNow, tiltNow, capeReady, maxDrift, drifted, rows,
+  volMultNow, tiltNow, capeReady, sentLast, sentObs, sentMinObs, sentNow, maxDrift, drifted, rows,
 } = await getEngineState();
 
 const engines: { cls: string; name: string; rule: string; icon: string; state: Tok[] }[] = [
@@ -41,6 +41,15 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
         : ["偏移 ", { b: `${tiltNow >= 0 ? "+" : ""}${(tiltNow * 100).toFixed(1)}%`, cls: tiltNow >= 0 ? "up" : "down" }, " · 贵时收敛、便宜时扩张"],
   },
   {
+    cls: sentLast && sentObs >= sentMinObs ? "p" : "w", name: "情绪引擎", rule: "新闻净宽度滚动百分位 → ±10% 线性偏移（恐慌多买，亢奋少买）",
+    icon: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+    state: !sentLast
+      ? [{ b: "⚠ 读数未同步", cls: "down" }, "，引擎按关闭处理"]
+      : sentNow === null
+        ? ["读数 ", { b: sentLast.value.toFixed(0) }, `（50=中性）· 攒数据中 `, { b: `${sentObs}/${sentMinObs}` }, " 天，攒够前按关闭处理"]
+        : [`读数 `, { b: sentLast.value.toFixed(0) }, " · 偏移 ", { b: `${sentNow >= 0 ? "+" : ""}${(sentNow * 100).toFixed(1)}%`, cls: sentNow >= 0 ? "up" : "down" }, " · 恐慌扩张、亢奋收敛"],
+  },
+  {
     cls: "p", name: "漂移引擎", rule: `任一标的权重偏离目标 ±${e.drift.thresholdPp}pp 即拉回，抑制磨损`,
     icon: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
     state: ["最大偏离 ", { b: `${maxDrift.toFixed(2)}pp` }, " · 超阈值 ", { b: String(drifted) }, `/${rows.length} 只`],
@@ -54,7 +63,7 @@ const engines: { cls: string; name: string; rule: string; icon: string; state: T
   },
 ];
 ---
-<Base active="engines" crumb="策略引擎" sub="六模块各自读到什么、规则是什么、离动作多远">
+<Base active="engines" crumb="策略引擎" sub="七模块各自读到什么、规则是什么、离动作多远">
   <div slot="actions" class="stack" style="flex-direction:row;gap:8px">
     <span class:list={["badge", regime]}><span class="dot"></span>{REGIME_LABEL[regime]} · {score.toFixed(3)}</span>
     <span class="chip">回测 run #{run?.id ?? "—"}</span>

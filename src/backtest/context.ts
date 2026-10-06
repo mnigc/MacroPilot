@@ -2,7 +2,7 @@ import "dotenv/config";
 import { existsSync, readFileSync } from "node:fs";
 import { fetchMacroBundle, MACRO_SERIES } from "../data/fred.js";
 import { computeRegimeTimeline, type MacroBundle, type RegimeConfig, type RegimePoint } from "../strategy/regime.js";
-import { volMultiplierSeries, valuationTiltSeries, type ValuationConfig, type VolTargetConfig } from "../strategy/overlays.js";
+import { volMultiplierSeries, valuationTiltSeries, sentimentTiltSeries, type SentimentConfig, type ValuationConfig, type VolTargetConfig } from "../strategy/overlays.js";
 import { computeAdvDollars, getPool, initSchema, loadPricesAndVolumesFromDb, upsertPrices } from "../db/index.js";
 import { allEarningsByTicker } from "../db/index.js";
 import { parseFredCsv, parsePriceCsv, type Point } from "../data/stats.js";
@@ -29,6 +29,7 @@ export interface StrategyFile {
     };
     volTarget?: { enabled?: boolean; targetVol: number; lookbackDays: number; floor: number; ceiling: number; triggerPp: number };
     valuation?: { enabled?: boolean; maxTilt: number; lookbackYears: number; triggerPp: number };
+    sentiment?: { enabled?: boolean; maxTilt: number; lookbackDays: number; minObs: number; triggerPp: number };
     drift: { thresholdPp: number };
     earnings: { enabled?: boolean; riskOffDaysBefore: number; scaleFactor: number; restoreDaysAfter: number };
   };
@@ -91,6 +92,17 @@ export function valuationConfigOf(s: StrategyFile): ValuationConfig & { enabled:
   };
 }
 
+export function sentimentConfigOf(s: StrategyFile): SentimentConfig & { enabled: boolean; triggerPp: number } {
+  const v = s.engines.sentiment;
+  return {
+    enabled: v?.enabled ?? false,
+    maxTilt: v?.maxTilt ?? 0.1,
+    lookbackDays: v?.lookbackDays ?? 120,
+    minObs: v?.minObs ?? 40,
+    triggerPp: v?.triggerPp ?? 5,
+  };
+}
+
 export interface BacktestContext {
   bundle: MacroBundle;
   timeline: RegimePoint[];
@@ -102,18 +114,30 @@ export interface BacktestContext {
   earningsByTicker: Map<string, string[]>;
   /** CAPE 月度序列；未同步时为空 */
   cape: Point[];
+  /** 新闻情绪日读数（0~100）；未同步时为空 */
+  sentiment: Point[];
   /** 与时间线日历对齐的叠加层序列 */
   volMult: (number | undefined)[];
   tilt: (number | undefined)[];
+  sentTilt: (number | undefined)[];
   /** 数据可用性注记（页面/控制台展示用） */
   notes: string[];
   volCfg: VolTargetConfig & { enabled: boolean; triggerPp: number };
   valCfg: ValuationConfig & { enabled: boolean; triggerPp: number };
+  sentCfg: SentimentConfig & { enabled: boolean; triggerPp: number };
 }
 
 /** data/valuation/cape.csv（date,value 月度）——sync-valuation.py 的产物；缺失返回空 */
 export function loadCape(): Point[] {
   const path = "data/valuation/cape.csv";
+  if (!existsSync(path)) return [];
+  const points = parseFredCsv(readFileSync(path, "utf8"));
+  return points.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/** data/news/sentiment.csv（date,value 日读数）——sync-news.py 的产物；缺失返回空 */
+export function loadSentiment(): Point[] {
+  const path = "data/news/sentiment.csv";
   if (!existsSync(path)) return [];
   const points = parseFredCsv(readFileSync(path, "utf8"));
   return points.sort((a, b) => a.date.localeCompare(b.date));
@@ -187,6 +211,11 @@ export async function loadBacktestContext(
   const cape = loadCape();
   if (!cape.length) notes.push("未找到 data/valuation/cape.csv：估值锚引擎按关闭处理（scripts/sync-valuation.py 可生成）");
 
+  const sentiment = loadSentiment();
+  const sentCfg = sentimentConfigOf(s);
+  if (!sentiment.length) notes.push("未找到 data/news/sentiment.csv：情绪引擎按关闭处理（scripts/sync-news.py 可生成，历史无法回填需逐日积累）");
+  else if (sentiment.length < sentCfg.minObs) notes.push(`情绪读数仅 ${sentiment.length} 天（< minObs ${sentCfg.minObs}）：偏移尚未生效，继续逐日积累`);
+
   // 叠加层在"完整价格日历"上计算，再对齐到时间线日历——时间线从预热后才开始，
   // 直接在时间线上滚动会丢掉启动段的回看窗口
   const fullCalendar = bundle.trend.map((p) => p.date);
@@ -195,8 +224,10 @@ export async function loadBacktestContext(
   const valCfg = valuationConfigOf(s);
   const volFull = volMultiplierSeries(closes, fullCalendar, volCfg);
   const tiltFull = valuationTiltSeries(cape, fullCalendar, valCfg);
+  const sentFull = sentimentTiltSeries(sentiment, fullCalendar, sentCfg);
   const volMult = timeline.map((p) => volFull[idxOf.get(p.date) as number]);
   const tilt = timeline.map((p) => tiltFull[idxOf.get(p.date) as number]);
+  const sentTilt = timeline.map((p) => sentFull[idxOf.get(p.date) as number]);
 
-  return { bundle, timeline, closes, advDollars, earningsByTicker, cape, volMult, tilt, notes, volCfg, valCfg };
+  return { bundle, timeline, closes, advDollars, earningsByTicker, cape, sentiment, volMult, tilt, sentTilt, notes, volCfg, valCfg, sentCfg };
 }

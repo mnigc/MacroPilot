@@ -11,7 +11,7 @@ import "dotenv/config";
 import { createHash } from "node:crypto";
 import { runOnce, type ExecutorConfig } from "./exec/executor.js";
 import { earningsCalendarStatus } from "./db/index.js";
-import { regimeConfigOf, loadStrategyFile, volTargetConfigOf, valuationConfigOf } from "./backtest/context.js";
+import { regimeConfigOf, loadStrategyFile, volTargetConfigOf, valuationConfigOf, sentimentConfigOf } from "./backtest/context.js";
 import { loadAccountFile } from "./account/config.js";
 import { splitDrivers } from "./strategy/drivers.js";
 
@@ -82,6 +82,7 @@ const cfg: ExecutorConfig = {
   },
   volTarget: volTargetConfigOf(raw),
   valuation: valuationConfigOf(raw),
+  sentiment: sentimentConfigOf(raw),
   cost: raw.execution.cost ?? { halfSpreadBps: 3, impactCoef: 0.35, earningsMult: 1.5 },
   cashInterest: raw.execution.cashInterest ?? true,
   // 配置签名：影响目标表的全部参数——变更即触发 retarget 对齐，不等漂移阈值。
@@ -93,6 +94,7 @@ const cfg: ExecutorConfig = {
         gate: raw.engines.regime.gate ?? null,
         volTarget: raw.engines.volTarget ?? null,
         valuation: raw.engines.valuation ?? null,
+        sentiment: raw.engines.sentiment ?? null,
         drift: raw.engines.drift,
         earnings: raw.engines.earnings,
         tickers: raw.basket.tickers,
@@ -120,7 +122,8 @@ console.log(
 );
 console.log(
   `目标股票仓位: ${(summary.composedEquityTarget * 100).toFixed(1)}% = 体制 ${(composition.regimeTarget * 100).toFixed(0)}%` +
-    ` × 波动率 ${composition.volMult !== undefined ? composition.volMult.toFixed(2) : "—"} × (1 + 估值 ${composition.tilt !== undefined ? (composition.tilt * 100).toFixed(1) + "%" : "—"})`,
+    ` × 波动率 ${composition.volMult !== undefined ? composition.volMult.toFixed(2) : "—"} × (1 + 估值 ${composition.tilt !== undefined ? (composition.tilt * 100).toFixed(1) + "%" : "—"})` +
+    ` × (1 + 情绪 ${composition.sentTilt !== undefined ? (composition.sentTilt * 100).toFixed(1) + "%" : "—"})`,
 );
 if (summary.cashInterestUsd > 0) console.log(`现金计息: +$${summary.cashInterestUsd.toFixed(2)}（DGS3MO，按距上一轮天数）`);
 if (summary.injectionUsd > 0) {
@@ -144,7 +147,7 @@ if (summary.trades.length === 0) {
   let costs = 0;
   for (const t of summary.trades) {
     const drivers = splitDrivers(t.drivers.join(","))
-      .map((d) => ({ seed: "初始建仓", dca: "定投", regime: "体制", volTarget: "波动率", valuation: "估值", retarget: "调参", drift: "漂移", earnings: "财报" })[d])
+      .map((d) => ({ seed: "初始建仓", dca: "定投", regime: "体制", volTarget: "波动率", valuation: "估值", sentiment: "情绪", retarget: "调参", drift: "漂移", earnings: "财报" })[d])
       .join("+");
     costs += t.costUsd;
     console.log(

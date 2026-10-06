@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      OPENNEWS_TOKEN: ${{ secrets.OPENNEWS_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,6 +40,7 @@ jobs:
             python scripts/sync-prices.py
           fi
           python scripts/sync-valuation.py
+          python scripts/sync-news.py
       # CSV 只是传输格式：close+volume、财报日全部入库，运行时统一从 DB 读
       - name: import to postgres
         run: npm run import-csv
@@ -46,6 +48,6 @@ jobs:
         run: |
           git config user.name "data-bot"
           git config user.email "mnigc@users.noreply.github.com"
-          git add data/prices data/earnings data/valuation
-          git diff --cached --quiet || git commit -m "data: sync prices + earnings + cape $(date -u +%F)"
+          git add data/prices data/earnings data/valuation data/news
+          git diff --cached --quiet || git commit -m "data: sync prices + earnings + cape + sentiment $(date -u +%F)"
           git push

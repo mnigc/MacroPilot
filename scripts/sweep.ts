@@ -25,7 +25,7 @@ const volCfg = volTargetConfigOf(s);
 const tickers = [...ctx.closes.keys()];
 const fullCalendar = ctx.bundle.trend.map((p) => p.date);
 
-const ENGINES: EngineToggles = { dca: true, regime: true, volTarget: true, valuation: true, drift: true, earnings: true };
+const ENGINES: EngineToggles = { dca: true, regime: true, volTarget: true, valuation: true, sentiment: true, drift: true, earnings: true };
 
 const baseCfg = {
   tickers,
@@ -36,6 +36,7 @@ const baseCfg = {
   cost: { ...(s.execution.cost ?? { halfSpreadBps: 3, impactCoef: 0.35, earningsMult: 1.5 }), flatBps: s.execution.slippagePercent * 100 },
   volTriggerPp: volCfg.triggerPp,
   valueTriggerPp: s.engines.valuation?.triggerPp ?? 5,
+  sentTriggerPp: s.engines.sentiment?.triggerPp ?? 5,
   earnings: {
     daysBefore: s.engines.earnings.riskOffDaysBefore,
     daysAfter: s.engines.earnings.restoreDaysAfter,
@@ -56,7 +57,7 @@ function buildTimeline(scoreHigh: number, scoreLow: number, targetVol: number): 
 }
 
 function runOn(timeline: RegimePoint[], volMult: (number | undefined)[], driftPp = baseCfg.driftThresholdPp) {
-  return runBacktest(ctx.closes, timeline, { ...baseCfg, engines: ENGINES, volMult, tilt: ctx.tilt, driftThresholdPp: driftPp });
+  return runBacktest(ctx.closes, timeline, { ...baseCfg, engines: ENGINES, volMult, tilt: ctx.tilt, sentTilt: ctx.sentTilt, driftThresholdPp: driftPp });
 }
 
 const evalSharp = (timeline: RegimePoint[], volMult: (number | undefined)[], driftPp?: number, from?: string, to?: string) => {

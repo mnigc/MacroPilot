@@ -6,7 +6,7 @@ import type { Point } from "../data/stats.js";
 /**
  * 组合回测：与实盘执行器共用同一套目标权重合成逻辑。
  *
- * 目标仓位三层合成：体制档位（含 Sahm 门）× 波动率乘数 × (1+估值偏移)，
+ * 目标仓位四层合成：体制档位（含 Sahm 门）× 波动率乘数 × (1+估值偏移) × (1+情绪偏移)，
  * 个股层再叠加财报缩放；每层引擎可独立开关——消融实验据此测出每一层的贡献。
  *
  * 成本模型（逐笔，不再是一刀切常数）：bps = 半价差 + impactCoef × √(名义额/ADV20)，
@@ -36,6 +36,7 @@ export interface EngineToggles {
   regime: boolean;
   volTarget: boolean;
   valuation: boolean;
+  sentiment: boolean;
   drift: boolean;
   earnings: boolean;
 }
@@ -52,9 +53,12 @@ export interface BacktestConfig {
   volMult?: (number | undefined)[];
   /** 估值偏移序列（与日历对齐）；关闭或无 CAPE 时按 0 处理 */
   tilt?: (number | undefined)[];
-  /** 波动率/估值乘数相对上次调仓的变化超过该百分点数才触发调仓并记驱动 */
+  /** 情绪偏移序列（与日历对齐）；关闭或读数不足 minObs 时按 0 处理 */
+  sentTilt?: (number | undefined)[];
+  /** 波动率/估值/情绪乘数相对上次调仓的变化超过该百分点数才触发调仓并记驱动 */
   volTriggerPp: number;
   valueTriggerPp: number;
+  sentTriggerPp: number;
   /** 财报引擎：窗口与缩放，以及全部历史财报日 */
   earnings: { daysBefore: number; daysAfter: number; scale: number };
   earningsByTicker: Map<string, string[]>;
@@ -141,6 +145,7 @@ export function runBacktest(
   // 上次调仓时点的叠加层读数：驱动归因的比较基准
   let volMultAtRebalance: number | undefined;
   let tiltAtRebalance: number | undefined;
+  let sentTiltAtRebalance: number | undefined;
   let anyTradeYet = false;
 
   /** 逐笔单边成本率：半价差 + √冲击，财报窗口放大；无 ADV → flatBps */
@@ -242,11 +247,12 @@ export function runBacktest(
       }
     }
 
-    // ---- 策略腿目标仓位：体制档位 × 波动率乘数 × (1 + 估值偏移) ----
+    // ---- 策略腿目标仓位：体制档位 × 波动率乘数 × (1 + 估值偏移) × (1 + 情绪偏移) ----
     const regimeTarget = cfg.engines.regime ? regimePoint.equityTarget : 1;
     const volMult = cfg.engines.volTarget ? cfg.volMult?.[i] : undefined;
     const tilt = cfg.engines.valuation ? cfg.tilt?.[i] : undefined;
-    const equityTarget = composeEquityTarget(regimeTarget, volMult, tilt);
+    const sentTilt = cfg.engines.sentiment ? cfg.sentTilt?.[i] : undefined;
+    const equityTarget = composeEquityTarget(regimeTarget, volMult, tilt, sentTilt);
     targetSeries.push({ date, value: equityTarget });
 
     if (friday && cfg.engines.dca) cash += cfg.dcaUsdt;
@@ -273,6 +279,13 @@ export function runBacktest(
       Math.abs(tilt - tiltAtRebalance) * 100 > cfg.valueTriggerPp
     )
       batchDrivers.push("valuation");
+    if (
+      cfg.engines.sentiment &&
+      sentTilt !== undefined &&
+      sentTiltAtRebalance !== undefined &&
+      Math.abs(sentTilt - sentTiltAtRebalance) * 100 > cfg.sentTriggerPp
+    )
+      batchDrivers.push("sentiment");
     if (
       cfg.engines.drift &&
       equity > 0 &&
@@ -329,6 +342,7 @@ export function runBacktest(
         anyTradeYet = true;
         volMultAtRebalance = volMult ?? volMultAtRebalance;
         tiltAtRebalance = tilt ?? tiltAtRebalance;
+        sentTiltAtRebalance = sentTilt ?? sentTiltAtRebalance;
       }
     }
 

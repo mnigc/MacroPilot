@@ -188,7 +188,7 @@ const driftWarm = preview?.drifts
             <div class="tile">
               <div class="tile-k">目标仓位合成</div>
               <div class="tile-v sm">{((preview.composition.final ?? 0) * 100).toFixed(0)}%</div>
-              <div class="tile-s">体制 {(preview.composition.regimeTarget * 100).toFixed(0)}% × 波动率 {preview.composition.volMult !== null ? `×${preview.composition.volMult.toFixed(2)}` : "×—"}{preview.composition.tilt !== null ? ` × (1${preview.composition.tilt >= 0 ? "+" : ""}${(preview.composition.tilt * 100).toFixed(1)}%)` : ""}</div>
+              <div class="tile-s">体制 {(preview.composition.regimeTarget * 100).toFixed(0)}% × 波动率 {preview.composition.volMult !== null ? `×${preview.composition.volMult.toFixed(2)}` : "×—"}{preview.composition.tilt !== null ? ` × (1${preview.composition.tilt >= 0 ? "+" : ""}${(preview.composition.tilt * 100).toFixed(1)}%)` : ""}{preview.composition.sentTilt != null ? ` × (1${preview.composition.sentTilt >= 0 ? "+" : ""}${(preview.composition.sentTilt * 100).toFixed(1)}%)` : ""}</div>
             </div>
             <div class="tile">
               {previewShadow ? (
